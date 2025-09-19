@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import multiprocessing
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional
 
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 import uvicorn
+
+from ..tasks.buildium_processor import (
+    BuildiumProcessorError,
+    enqueue_buildium_webhook,
+)
+from .verification import verify_buildium_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +35,6 @@ class BuildiumWebhookEnvelope:
     headers: Mapping[str, str]
     body: bytes
     parsed_body: Optional[Any]
-
-
-# A reasonably high default queue size protects the listener from a burst of
-# requests while ensuring we never block the HTTP response path.
-_QUEUE_MAXSIZE = 1024
-webhook_queue: "asyncio.Queue[BuildiumWebhookEnvelope]" = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
 
 
 def _extract_metadata(
@@ -71,7 +70,7 @@ def _extract_metadata(
 
 @app.post("/webhooks/buildium", status_code=status.HTTP_200_OK)
 async def handle_buildium_webhook(request: Request) -> Response:
-    """Receive a webhook call from Buildium and enqueue it for processing."""
+    """Receive a webhook call from Buildium, verify it, and enqueue processing."""
 
     raw_body = await request.body()
     parsed_body: Optional[Any]
@@ -87,12 +86,57 @@ async def handle_buildium_webhook(request: Request) -> Response:
     envelope = BuildiumWebhookEnvelope(headers=headers, body=raw_body, parsed_body=parsed_body)
 
     try:
-        webhook_queue.put_nowait(envelope)
-    except asyncio.QueueFull:
+        verified_webhook = await verify_buildium_webhook(envelope)
+    except HTTPException as exc:
         logger.warning(
-            "Webhook queue is full; dropping payload to preserve responsiveness.",
+            "Rejected Buildium webhook during verification.",
+            extra={"metadata": metadata, "status_code": exc.status_code},
+        )
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception(
+            "Unexpected failure while verifying Buildium webhook payload.",
             extra={"metadata": metadata},
         )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to verify Buildium webhook payload.",
+        ) from exc
+
+    metadata.update(
+        {
+            "account_id": verified_webhook.account_id,
+            "verification_scheme": verified_webhook.verification_scheme,
+        }
+    )
+
+    logger.info("Verified Buildium webhook", extra={"metadata": metadata})
+
+    try:
+        enqueue_buildium_webhook(verified_webhook)
+    except BuildiumProcessorError as exc:
+        logger.error(
+            "Failed to enqueue Buildium webhook for processing.",
+            extra={"metadata": metadata},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to queue Buildium webhook for processing.",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception(
+            "Unexpected error while scheduling Buildium webhook processing.",
+            extra={"metadata": metadata},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to queue Buildium webhook for processing.",
+        ) from exc
+
+    logger.info(
+        "Buildium webhook dispatched for asynchronous processing.",
+        extra={"metadata": metadata},
+    )
 
     return Response(status_code=status.HTTP_200_OK)
 
@@ -108,4 +152,4 @@ def run(host: str = "0.0.0.0", port: int = 8080, workers: Optional[int] = None) 
     uvicorn.run(app, host=host, port=port, workers=workers, log_level="info")
 
 
-__all__ = ["app", "run", "webhook_queue", "BuildiumWebhookEnvelope"]
+__all__ = ["app", "run", "BuildiumWebhookEnvelope"]
