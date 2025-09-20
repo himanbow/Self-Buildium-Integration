@@ -22,6 +22,20 @@ from .verification import VerifiedBuildiumWebhook, verify_buildium_webhook
 
 logger = logging.getLogger(__name__)
 
+_SENSITIVE_HEADER_PREFIXES = ("authorization",)
+_SENSITIVE_HEADER_KEYS = {
+    "x-buildium-hmac-sha256",
+    "x-buildium-hmacsha256",
+    "x-buildium-signature",
+    "x-buildium-verification-secret",
+    "x-buildium-verification-token",
+    "x-buildium-webhook-token",
+    "x-buildium-webhook-secret",
+    "x-hub-signature",
+    "x-hub-signature-256",
+}
+_BODY_PREVIEW_LIMIT = 2048
+
 app = FastAPI(
     title="Buildium Webhook Listener",
     description=(
@@ -69,6 +83,28 @@ def _extract_metadata(
                 break
 
     return metadata
+
+
+def _summarize_headers_for_logging(headers: Mapping[str, str]) -> Dict[str, str]:
+    sanitized: Dict[str, str] = {}
+    for key, value in headers.items():
+        normalized_key = key.lower()
+        if normalized_key.startswith(_SENSITIVE_HEADER_PREFIXES) or normalized_key in _SENSITIVE_HEADER_KEYS:
+            sanitized[normalized_key] = "<redacted>"
+        else:
+            sanitized[normalized_key] = value
+    return sanitized
+
+
+def _preview_body_for_logging(body: bytes, *, limit: int = _BODY_PREVIEW_LIMIT) -> str:
+    if not body:
+        return ""
+
+    decoded = body.decode("utf-8", "replace")
+    if len(decoded) <= limit:
+        return decoded
+
+    return f"{decoded[:limit]}… <truncated {len(decoded) - limit} characters>"
 
 
 def _deserialize_verified_webhook_task(payload: Mapping[str, Any]) -> VerifiedBuildiumWebhook:
@@ -146,6 +182,17 @@ async def handle_buildium_webhook(request: Request) -> Response:
     metadata = _extract_metadata(headers=headers, parsed_body=parsed_body, body=raw_body)
     logger.info("Received Buildium webhook", extra={"metadata": metadata})
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Buildium webhook request payload captured.",
+            extra={
+                "metadata": metadata,
+                "headers": _summarize_headers_for_logging(headers),
+                "body_preview": _preview_body_for_logging(raw_body),
+                "parsed_body_type": type(parsed_body).__name__ if parsed_body is not None else None,
+            },
+        )
+
     envelope = BuildiumWebhookEnvelope(headers=headers, body=raw_body, parsed_body=parsed_body)
 
     try:
@@ -153,7 +200,11 @@ async def handle_buildium_webhook(request: Request) -> Response:
     except HTTPException as exc:
         logger.warning(
             "Rejected Buildium webhook during verification.",
-            extra={"metadata": metadata, "status_code": exc.status_code},
+            extra={
+                "metadata": metadata,
+                "status_code": exc.status_code,
+                "headers": _summarize_headers_for_logging(headers),
+            },
         )
         raise
     except Exception as exc:  # pragma: no cover - defensive guard
