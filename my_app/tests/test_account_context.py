@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional
 
+import pytest
+from fastapi import HTTPException, status
+from google.api_core import exceptions as google_exceptions
+
 import my_app.services.account_context as account_context
 
 
@@ -131,3 +135,25 @@ def test_get_buildium_account_context_falls_back_to_secret_manager_for_webhook_s
         "api_secret_name": "projects/example/secrets/api/versions/1",
         "webhook_secret_name": "projects/example/secrets/webhook/versions/1",
     }
+
+
+def test_access_secret_permission_denied() -> None:
+    class _PermissionDeniedSecretManagerClient:
+        def access_secret_version(self, request: Mapping[str, Any]) -> Any:  # pragma: no cover - interface stub
+            raise google_exceptions.PermissionDenied(
+                "Permission denied on resource project mantler-api-secret."
+            )
+
+    client = _PermissionDeniedSecretManagerClient()
+    access_secret = getattr(account_context, "_access_secret")
+
+    with pytest.raises(HTTPException) as exc_info:
+        access_secret(
+            client=client,
+            secret_name="projects/example/secrets/api/versions/1",
+            account_id="acct-789",
+            secret_type="api_secret",
+        )
+
+    assert exc_info.value.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert exc_info.value.detail == "Buildium secret storage is not authorized."

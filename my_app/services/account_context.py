@@ -64,6 +64,21 @@ def _access_secret(
 
     try:
         response = client.access_secret_version(request={"name": secret_name})
+    except (google_exceptions.PermissionDenied, google_exceptions.Forbidden) as exc:
+        message = "Access to Buildium secret in Google Secret Manager was denied."
+        logger.error(
+            message,
+            extra={
+                "account_id": account_id,
+                "secret_type": secret_type,
+                "secret_name": secret_name,
+            },
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Buildium secret storage is not authorized.",
+        ) from exc
     except google_exceptions.NotFound as exc:
         message = "Referenced secret was not found in Google Secret Manager."
         logger.error(
