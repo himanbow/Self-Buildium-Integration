@@ -139,6 +139,33 @@ def test_verify_buildium_webhook_accepts_structured_signature(monkeypatch: pytes
     assert verified.verification_scheme == "hmac"
 
 
+def test_verify_buildium_webhook_accepts_timestamp_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    account_id = "acct-001"
+    secret = "timestamp-secret"
+    _install_account_context(monkeypatch, secret)
+
+    body = _build_body(account_id)
+    timestamp = str(int(time.time()))
+    signed_payload = f"{timestamp}.".encode("utf-8") + body
+    digest = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).digest()
+    signature = base64.b64encode(digest).decode("ascii")
+
+    envelope = _FakeEnvelope(
+        headers={
+            "Buildium-Webhook-Signature": signature,
+            "Buildium-Webhook-Timestamp": timestamp,
+        },
+        body=body,
+        parsed_body={"AccountId": account_id},
+    )
+
+    verified = asyncio.run(verification.verify_buildium_webhook(envelope))
+
+    assert verified.account_id == account_id
+    assert verified.signature == signature
+    assert verified.verification_scheme == "hmac"
+
+
 def test_verify_buildium_webhook_rejects_stale_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
     account_id = "acct-456"
     secret = "stale-secret"
