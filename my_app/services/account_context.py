@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 
 from fastapi import HTTPException, status
-from google.api_core import exceptions as google_exceptions
-from google.cloud import firestore, secretmanager
+
+if TYPE_CHECKING:  # pragma: no cover - imported for static analysis only
+    from google.api_core import exceptions as google_exceptions
+    from google.cloud import firestore, secretmanager
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ def _access_secret(
     account_id: str,
     secret_type: str,
 ) -> str:
+    from google.api_core import exceptions as google_exceptions
+
     """Resolve a secret version and return its UTF-8 decoded payload."""
 
     if not secret_name:
@@ -111,6 +115,9 @@ def get_buildium_account_context(
     firestore_client: Optional[firestore.Client] = None,
     secret_manager_client: Optional[secretmanager.SecretManagerServiceClient] = None,
 ) -> BuildiumAccountContext:
+    from google.api_core import exceptions as google_exceptions
+    from google.cloud import firestore, secretmanager
+
     """Fetch persisted Buildium account metadata and resolve associated secrets."""
 
     if not account_id:
