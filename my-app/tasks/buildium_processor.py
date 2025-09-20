@@ -7,7 +7,8 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Protocol
 
 from ..webhooks.verification import VerifiedBuildiumWebhook
 
@@ -133,6 +134,141 @@ def _extract_gl_mapping(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
+class AutomationHandler(Protocol):
+    def __call__(
+        self,
+        *,
+        account_id: str,
+        api_headers: Mapping[str, str],
+        gl_mapping: Mapping[str, Any],
+        webhook: Mapping[str, Any],
+    ) -> None:
+        """Handle a routed automation task."""
+
+
+def handle_initiation_automation(
+    *,
+    account_id: str,
+    api_headers: Mapping[str, str],
+    gl_mapping: Mapping[str, Any],
+    webhook: Mapping[str, Any],
+) -> None:
+    """Process the Initiation automation webhook."""
+
+    logger.info(
+        "Handling Initiation automation task.",
+        extra={
+            "account_id": account_id,
+            "gl_mapping_keys": sorted(gl_mapping.keys()),
+            "header_names": sorted(api_headers.keys()),
+        },
+    )
+
+
+def handle_n1_increase_automation(
+    *,
+    account_id: str,
+    api_headers: Mapping[str, str],
+    gl_mapping: Mapping[str, Any],
+    webhook: Mapping[str, Any],
+) -> None:
+    """Process the N1 Increase automation webhook."""
+
+    logger.info(
+        "Handling N1 Increase automation task.",
+        extra={
+            "account_id": account_id,
+            "gl_mapping_keys": sorted(gl_mapping.keys()),
+            "header_names": sorted(api_headers.keys()),
+        },
+    )
+
+
+_AUTOMATED_TASKS_KEY = "automatedtasks"
+_AUTOMATION_ROUTING_TABLE: Dict[Tuple[str, str], AutomationHandler] = {
+    ("taskcreated", "initiation"): handle_initiation_automation,
+    ("taskcreated", "n1increase"): handle_n1_increase_automation,
+    ("taskstatuschanged", "n1increase"): handle_n1_increase_automation,
+}
+
+
+def _normalize_identifier(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = "".join(ch for ch in value.lower() if ch.isalnum())
+    return normalized or None
+
+
+def _extract_event_type(webhook: Mapping[str, Any]) -> Optional[str]:
+    for key in ("eventType", "event_type", "type"):
+        if key in webhook:
+            event_type = _coerce_string(webhook[key])
+            if event_type:
+                return event_type
+    event_block = webhook.get("event")
+    if isinstance(event_block, Mapping):
+        for key in ("eventType", "event_type", "type"):
+            event_type = _coerce_string(event_block.get(key))
+            if event_type:
+                return event_type
+    return None
+
+
+def _extract_task_data(webhook: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    for key in ("task", "Task", "resource", "Resource"):
+        value = webhook.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _extract_task_name(task_data: Mapping[str, Any]) -> Optional[str]:
+    for key in ("taskName", "task_name", "name", "task"):
+        if key in task_data:
+            task_name = _coerce_string(task_data[key])
+            if task_name:
+                return task_name
+    return None
+
+
+def _extract_task_category_name(task_data: Mapping[str, Any]) -> Optional[str]:
+    for key in (
+        "taskCategoryName",
+        "task_category_name",
+        "categoryName",
+        "category",
+    ):
+        if key in task_data:
+            category = task_data[key]
+            if isinstance(category, Mapping):
+                for nested_key in ("name", "taskCategoryName", "categoryName"):
+                    nested_value = _coerce_string(category.get(nested_key))
+                    if nested_value:
+                        return nested_value
+            else:
+                category_name = _coerce_string(category)
+                if category_name:
+                    return category_name
+    for key in ("taskCategory", "task_category"):
+        category_block = task_data.get(key)
+        if isinstance(category_block, Mapping):
+            for nested_key in ("name", "taskCategoryName", "categoryName"):
+                nested_value = _coerce_string(category_block.get(nested_key))
+                if nested_value:
+                    return nested_value
+    return None
+
+
+def _select_automation_handler(
+    *, event_type: Optional[str], task_name: Optional[str]
+) -> Optional[AutomationHandler]:
+    event_key = _normalize_identifier(event_type)
+    task_key = _normalize_identifier(task_name)
+    if not event_key or not task_key:
+        return None
+    return _AUTOMATION_ROUTING_TABLE.get((event_key, task_key))
+
+
 @dataclass
 class BuildiumWebhookProcessor:
     """Prepare and execute a unit of Buildium webhook work."""
@@ -227,6 +363,75 @@ class BuildiumWebhookProcessor:
                 **self.metadata,
                 "payload_includes_gl_mapping": "gl_mapping" in payload,
             },
+        )
+
+        webhook_payload = payload.get("webhook")
+        if not isinstance(webhook_payload, Mapping):
+            logger.debug(
+                "Skipping Buildium webhook without structured task payload.",
+                extra={**self.metadata, "has_webhook_mapping": False},
+            )
+            return
+
+        task_data = _extract_task_data(webhook_payload)
+        if task_data is None:
+            logger.debug(
+                "No task details available in Buildium webhook payload.",
+                extra={**self.metadata, "has_task_data": False},
+            )
+            return
+
+        task_category_name = _extract_task_category_name(task_data)
+        if _normalize_identifier(task_category_name) != _AUTOMATED_TASKS_KEY:
+            logger.debug(
+                "Ignoring non-automated Buildium task payload.",
+                extra={
+                    **self.metadata,
+                    "task_category_name": task_category_name,
+                },
+            )
+            return
+
+        event_type = _extract_event_type(webhook_payload)
+        task_name = _extract_task_name(task_data)
+        handler = _select_automation_handler(event_type=event_type, task_name=task_name)
+        if handler is None:
+            logger.info(
+                "No automation handler registered for Buildium task payload.",
+                extra={
+                    **self.metadata,
+                    "event_type": event_type,
+                    "task_name": task_name,
+                },
+            )
+            return
+
+        account_id = _coerce_string(payload.get("account_id")) or self.verified_webhook.account_id
+        raw_api_headers = payload.get("api_headers")
+        if isinstance(raw_api_headers, Mapping):
+            api_headers = dict(raw_api_headers)
+        else:
+            api_headers = dict(self._processing_context.api_headers)
+
+        raw_gl_mapping = payload.get("gl_mapping")
+        gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
+
+        logger.info(
+            "Dispatching Buildium automation task to handler.",
+            extra={
+                **self.metadata,
+                "event_type": event_type,
+                "task_name": task_name,
+                "task_category_name": task_category_name,
+                "handler_name": getattr(handler, "__name__", str(handler)),
+            },
+        )
+
+        handler(
+            account_id=account_id,
+            api_headers=api_headers,
+            gl_mapping=gl_mapping,
+            webhook=webhook_payload,
         )
 
 
