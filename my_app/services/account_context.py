@@ -43,6 +43,14 @@ _WEBHOOK_SECRET_NAME_KEYS = (
 )
 
 _SECRET_PROJECT_ENV_VAR = "SECRET_PROJECT_ID"
+_PROJECT_ID_ENV_CANDIDATES = (
+    "GOOGLE_CLOUD_PROJECT",
+    "CLOUD_RUN_PROJECT",
+    "GCP_PROJECT",
+    "GOOGLE_PROJECT_ID",
+    "GCLOUD_PROJECT",
+    "PROJECT_ID",
+)
 
 
 def _get_secret_project_id(*, account_id: str, secret_type: str) -> str:
@@ -67,6 +75,19 @@ def _get_secret_project_id(*, account_id: str, secret_type: str) -> str:
 
     if project_id:
         return project_id
+
+    for env_name in _PROJECT_ID_ENV_CANDIDATES:
+        fallback_project_id = os.getenv(env_name)
+        if fallback_project_id:
+            logger.info(
+                "Resolved Secret Manager project id from environment variable.",
+                extra={
+                    "account_id": account_id,
+                    "secret_type": secret_type,
+                    "environment_variable": env_name,
+                },
+            )
+            return fallback_project_id
 
     logger.error(
         "Google application default credentials do not specify a project id.",

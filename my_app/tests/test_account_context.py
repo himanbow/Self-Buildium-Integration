@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import pytest
 from fastapi import HTTPException, status
@@ -157,3 +157,19 @@ def test_access_secret_permission_denied() -> None:
 
     assert exc_info.value.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
     assert exc_info.value.detail == "Buildium secret storage is not authorized."
+
+
+def test_get_secret_project_id_falls_back_to_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SECRET_PROJECT_ID", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "example-project")
+
+    def _fake_default() -> Tuple[Any, Optional[str]]:
+        return object(), None
+
+    monkeypatch.setattr(account_context.google.auth, "default", _fake_default)
+
+    get_secret_project_id = getattr(account_context, "_get_secret_project_id")
+
+    project_id = get_secret_project_id(account_id="acct-000", secret_type="api_secret")
+
+    assert project_id == "example-project"
