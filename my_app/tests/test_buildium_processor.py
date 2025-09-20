@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 buildium_processor = importlib.import_module("my_app.tasks.buildium_processor")
 buildium_listener = importlib.import_module("my_app.webhooks.buildium_listener")
+config = importlib.import_module("my_app.config")
 BuildiumAccountContext = importlib.import_module("my_app.services.account_context").BuildiumAccountContext
 BuildiumWebhookEnvelope = buildium_listener.BuildiumWebhookEnvelope
 VerifiedBuildiumWebhook = importlib.import_module(
@@ -193,8 +194,23 @@ def test_enqueue_buildium_webhook_creates_cloud_task(monkeypatch) -> None:
     assert body_payload["envelope"]["body"] == base64.b64encode(b'{"event": "value"}').decode("ascii")
 
 
-def test_enqueue_buildium_webhook_requires_project_id(monkeypatch) -> None:
+def test_enqueue_buildium_webhook_uses_default_project_id(monkeypatch) -> None:
     verified_webhook = _make_verified_webhook()
+
+    class _DummyClient:
+        def __init__(self) -> None:
+            self.queue_path_args = None
+            self.requests = []
+
+        def queue_path(self, project: str, location: str, queue: str) -> str:
+            self.queue_path_args = (project, location, queue)
+            return f"projects/{project}/locations/{location}/queues/{queue}"
+
+        def create_task(self, request: Mapping[str, Any]) -> Mapping[str, str]:
+            self.requests.append(request)
+            return {"name": "tasks/example"}
+
+    client = _DummyClient()
 
     for env_name in (
         "GOOGLE_CLOUD_PROJECT",
@@ -205,8 +221,15 @@ def test_enqueue_buildium_webhook_requires_project_id(monkeypatch) -> None:
     ):
         monkeypatch.delenv(env_name, raising=False)
 
-    with pytest.raises(buildium_processor.BuildiumProcessorError):
-        buildium_processor.enqueue_buildium_webhook(verified_webhook, client=Mock())
+    response = buildium_processor.enqueue_buildium_webhook(verified_webhook, client=client)
+
+    assert response["name"] == "tasks/example"
+    assert client.queue_path_args == (
+        config.DEFAULT_GCP_PROJECT_ID,
+        buildium_processor._DEFAULT_CLOUD_TASKS_LOCATION,
+        buildium_processor._DEFAULT_CLOUD_TASKS_QUEUE,
+    )
+    assert client.requests, "Cloud Tasks request was not issued."
 
 
 def test_handle_buildium_webhook_task_processes_payload(monkeypatch) -> None:

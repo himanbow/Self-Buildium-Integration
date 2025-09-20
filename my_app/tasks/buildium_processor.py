@@ -14,6 +14,7 @@ from typing import Protocol
 from google.api_core import exceptions as google_exceptions
 from google.cloud import tasks_v2
 
+from ..config import DEFAULT_GCP_PROJECT_ID
 from ..webhooks.verification import VerifiedBuildiumWebhook
 from .initiation import handle_initiation_automation
 from .n1_increase import handle_n1_increase_automation
@@ -173,7 +174,8 @@ def _resolve_project_id() -> Optional[str]:
         value = os.getenv(env_name)
         if value:
             return value
-    return None
+    default_project_id = DEFAULT_GCP_PROJECT_ID.strip()
+    return default_project_id or None
 
 
 def _serialize_verified_webhook(verified_webhook: VerifiedBuildiumWebhook) -> Dict[str, Any]:

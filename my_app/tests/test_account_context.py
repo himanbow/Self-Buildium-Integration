@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException, status
 from google.api_core import exceptions as google_exceptions
 
+import my_app.config as config
 import my_app.services.account_context as account_context
 
 
@@ -173,3 +174,29 @@ def test_get_secret_project_id_falls_back_to_environment(monkeypatch: pytest.Mon
     project_id = get_secret_project_id(account_id="acct-000", secret_type="api_secret")
 
     assert project_id == "example-project"
+
+
+def test_get_secret_project_id_uses_default_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for env_name in (
+        "SECRET_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUD_RUN_PROJECT",
+        "GCP_PROJECT",
+        "GOOGLE_PROJECT_ID",
+        "GCLOUD_PROJECT",
+        "PROJECT_ID",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    def _fake_default() -> Tuple[Any, Optional[str]]:
+        return object(), None
+
+    monkeypatch.setattr(account_context.google.auth, "default", _fake_default)
+
+    get_secret_project_id = getattr(account_context, "_get_secret_project_id")
+
+    project_id = get_secret_project_id(account_id="acct-000", secret_type="api_secret")
+
+    assert project_id == config.DEFAULT_GCP_PROJECT_ID
