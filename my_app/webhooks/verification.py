@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import hashlib
 import hmac
 import json
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from fastapi import HTTPException, status
 
@@ -36,6 +38,15 @@ class VerifiedBuildiumWebhook:
     verification_scheme: str
 
 
+@dataclass(frozen=True)
+class _SignatureMetadata:
+    """Captured signature header details discovered during extraction."""
+
+    header_value: str
+    scheme: str
+    timestamp: Optional[str] = None
+
+
 _ACCOUNT_ID_HEADER_CANDIDATES: Tuple[str, ...] = (
     "x-buildium-account-id",
     "x-buildium-accountid",
@@ -60,6 +71,14 @@ _TOKEN_SIGNATURE_HEADERS: Tuple[str, ...] = (
     "x-buildium-webhook-token",
     "x-buildium-webhook-secret",
 )
+_SIGNATURE_TIMESTAMP_HEADERS: Tuple[str, ...] = (
+    "x-buildium-signature-timestamp",
+    "x-buildium-request-timestamp",
+    "x-buildium-timestamp",
+    "x-buildium-webhook-timestamp",
+)
+
+_SIGNATURE_MAX_AGE_SECONDS = 300
 
 
 def _normalize_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
@@ -113,18 +132,67 @@ def _extract_account_id(
 def _extract_signature(
     *,
     headers: Mapping[str, str],
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Optional[_SignatureMetadata]:
     normalized_headers = _normalize_headers(headers)
+
+    timestamp = _lookup_header(normalized_headers, _SIGNATURE_TIMESTAMP_HEADERS)
 
     signature = _lookup_header(normalized_headers, _HMAC_SIGNATURE_HEADERS)
     if signature:
-        return signature, "hmac"
+        return _SignatureMetadata(header_value=signature, scheme="hmac", timestamp=timestamp)
 
     signature = _lookup_header(normalized_headers, _TOKEN_SIGNATURE_HEADERS)
     if signature:
-        return signature, "token"
+        return _SignatureMetadata(header_value=signature, scheme="token")
 
-    return None, None
+    return None
+
+
+def _parse_signature_header(signature_header: str) -> Tuple[str, Optional[str], Optional[str], Mapping[str, str]]:
+    """Parse a structured signature header into components.
+
+    Returns the extracted signature, algorithm hint, timestamp (if embedded), and a
+    mapping of any discovered structured key/value pairs.
+    """
+
+    header = signature_header.strip()
+    if not header:
+        return "", None, None, {}
+
+    segments = [segment.strip() for segment in header.split(",") if segment.strip()]
+    structured_pairs: Dict[str, str] = {}
+
+    if any("=" in segment for segment in segments):
+        for segment in segments:
+            if "=" not in segment:
+                continue
+            key, value = segment.split("=", 1)
+            structured_pairs[key.strip().lower()] = value.strip()
+
+        signature = (
+            structured_pairs.get("v1")
+            or structured_pairs.get("sig")
+            or structured_pairs.get("signature")
+            or structured_pairs.get("s")
+            or structured_pairs.get("sha256")
+            or ""
+        )
+        timestamp = structured_pairs.get("t") or structured_pairs.get("timestamp")
+        algorithm = structured_pairs.get("alg") or structured_pairs.get("algorithm")
+
+        if not signature and len(structured_pairs) == 1:
+            # Handle values like "sha256=<signature>" where the only key encodes the
+            # algorithm name and the value is the signature payload.
+            signature = next(iter(structured_pairs.values()))
+            algorithm = next(iter(structured_pairs.keys()))
+
+        return signature, algorithm, timestamp, structured_pairs
+
+    if "=" in header:
+        algorithm, signature = header.split("=", 1)
+        return signature.strip(), algorithm.strip().lower(), None, {}
+
+    return header, None, None, {}
 
 
 def _verify_hmac_signature(
@@ -133,6 +201,7 @@ def _verify_hmac_signature(
     webhook_secret: str,
     body: bytes,
     account_id: str,
+    timestamp: Optional[str] = None,
 ) -> str:
     if not webhook_secret:
         raise HTTPException(
@@ -141,38 +210,98 @@ def _verify_hmac_signature(
         )
 
     provided_signature = signature_header.strip()
-    algorithm = "sha256"
-    if "=" in provided_signature:
-        algorithm, provided_signature = [segment.strip() for segment in provided_signature.split("=", 1)]
-        algorithm = algorithm.lower() or "sha256"
+    extracted_signature, algorithm, embedded_timestamp, _ = _parse_signature_header(provided_signature)
+    if extracted_signature:
+        provided_signature = extracted_signature
 
-    if algorithm not in {"sha256", "hmac-sha256", "hmac_sha256"}:
-        logger.warning(
-            "Unsupported Buildium webhook signature algorithm.",
-            extra={"account_id": account_id, "algorithm": algorithm},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unsupported Buildium webhook signature algorithm.",
-        )
+    candidate_timestamp = timestamp or embedded_timestamp
 
-    expected_signature = hmac.new(
-        webhook_secret.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+    if algorithm:
+        normalized_algorithm = algorithm.lower()
+        if normalized_algorithm not in {"sha256", "hmac-sha256", "hmac_sha256"}:
+            logger.warning(
+                "Unsupported Buildium webhook signature algorithm.",
+                extra={"account_id": account_id, "algorithm": normalized_algorithm},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unsupported Buildium webhook signature algorithm.",
+            )
 
-    if not hmac.compare_digest(provided_signature, expected_signature):
-        logger.warning(
-            "Buildium webhook signature verification failed.",
-            extra={"account_id": account_id},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Buildium webhook signature did not match.",
-        )
+    message_digests = [
+        hmac.new(
+            webhook_secret.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).digest()
+    ]
 
-    return expected_signature
+    if candidate_timestamp:
+        timestamp_value = candidate_timestamp.strip()
+        if not timestamp_value:
+            candidate_timestamp = None
+        else:
+            try:
+                timestamp_int = int(timestamp_value)
+            except ValueError:
+                logger.warning(
+                    "Buildium webhook signature timestamp is invalid.",
+                    extra={"account_id": account_id, "timestamp": timestamp_value},
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Buildium webhook signature timestamp is invalid.",
+                )
+
+            current_timestamp = int(time.time())
+            drift = abs(current_timestamp - timestamp_int)
+            if drift > _SIGNATURE_MAX_AGE_SECONDS:
+                logger.warning(
+                    "Buildium webhook signature timestamp is outside the tolerance window.",
+                    extra={
+                        "account_id": account_id,
+                        "timestamp": timestamp_value,
+                        "drift_seconds": drift,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Buildium webhook signature timestamp is outside the tolerance window.",
+                )
+
+            timestamp_bytes = f"{timestamp_int}.".encode("utf-8")
+            message_digests.append(
+                hmac.new(
+                    webhook_secret.encode("utf-8"),
+                    timestamp_bytes + body,
+                    hashlib.sha256,
+                ).digest()
+            )
+
+    expected_signatures = set()
+    for digest in message_digests:
+        hex_signature = digest.hex()
+        base64_signature = base64.b64encode(digest).decode("ascii")
+        base64_url_signature = base64.urlsafe_b64encode(digest).decode("ascii")
+
+        expected_signatures.add(hex_signature)
+        expected_signatures.add(base64_signature)
+        expected_signatures.add(base64_signature.rstrip("="))
+        expected_signatures.add(base64_url_signature)
+        expected_signatures.add(base64_url_signature.rstrip("="))
+
+    for expected_signature in expected_signatures:
+        if expected_signature and hmac.compare_digest(provided_signature, expected_signature):
+            return expected_signature
+
+    logger.warning(
+        "Buildium webhook signature verification failed.",
+        extra={"account_id": account_id},
+    )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Buildium webhook signature did not match.",
+    )
 
 
 def _verify_token_signature(
@@ -220,8 +349,8 @@ async def verify_buildium_webhook(
             detail="Buildium webhook is missing the account identifier.",
         )
 
-    signature_header, scheme = _extract_signature(headers=envelope.headers)
-    if not signature_header or not scheme:
+    signature_metadata = _extract_signature(headers=envelope.headers)
+    if not signature_metadata:
         logger.warning(
             "Received Buildium webhook without a verification signature.",
             extra={"account_id": account_id},
@@ -244,16 +373,17 @@ async def verify_buildium_webhook(
     else:
         account_context = resolver()
 
-    if scheme == "hmac":
+    if signature_metadata.scheme == "hmac":
         signature = _verify_hmac_signature(
-            signature_header=signature_header,
+            signature_header=signature_metadata.header_value,
             webhook_secret=account_context.webhook_secret,
             body=envelope.body,
             account_id=account_id,
+            timestamp=signature_metadata.timestamp,
         )
     else:
         signature = _verify_token_signature(
-            signature_header=signature_header,
+            signature_header=signature_metadata.header_value,
             webhook_secret=account_context.webhook_secret,
             account_id=account_id,
         )
@@ -262,7 +392,7 @@ async def verify_buildium_webhook(
         "Verified Buildium webhook signature.",
         extra={
             "account_id": account_id,
-            "verification_scheme": scheme,
+            "verification_scheme": signature_metadata.scheme,
         },
     )
 
@@ -271,7 +401,7 @@ async def verify_buildium_webhook(
         account_id=account_id,
         envelope=envelope,
         signature=signature,
-        verification_scheme=scheme,
+        verification_scheme=signature_metadata.scheme,
     )
 
 
