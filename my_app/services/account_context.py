@@ -11,6 +11,8 @@ import google.auth
 from google.auth import exceptions as google_auth_exceptions
 from fastapi import HTTPException, status
 
+from ..config import DEFAULT_GCP_PROJECT_ID
+
 if TYPE_CHECKING:  # pragma: no cover - imported for static analysis only
     from google.api_core import exceptions as google_exceptions
     from google.cloud import firestore, secretmanager
@@ -60,18 +62,12 @@ def _get_secret_project_id(*, account_id: str, secret_type: str) -> str:
     if project_id:
         return project_id
 
+    credentials_error: Optional[google_auth_exceptions.DefaultCredentialsError] = None
     try:
         _, project_id = google.auth.default()
     except google_auth_exceptions.DefaultCredentialsError as exc:
-        logger.error(
-            "Unable to determine GCP project id for Buildium secret access.",
-            extra={"account_id": account_id, "secret_type": secret_type},
-            exc_info=exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Buildium secret storage project is not configured.",
-        ) from exc
+        credentials_error = exc
+        project_id = None
 
     if project_id:
         return project_id
@@ -88,6 +84,29 @@ def _get_secret_project_id(*, account_id: str, secret_type: str) -> str:
                 },
             )
             return fallback_project_id
+
+    default_project_id = DEFAULT_GCP_PROJECT_ID.strip()
+    if default_project_id:
+        logger.info(
+            "Using default Secret Manager project id for Buildium secrets.",
+            extra={
+                "account_id": account_id,
+                "secret_type": secret_type,
+                "project_id": default_project_id,
+            },
+        )
+        return default_project_id
+
+    if credentials_error is not None:
+        logger.error(
+            "Unable to determine GCP project id for Buildium secret access.",
+            extra={"account_id": account_id, "secret_type": secret_type},
+            exc_info=credentials_error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Buildium secret storage project is not configured.",
+        ) from credentials_error
 
     logger.error(
         "Google application default credentials do not specify a project id.",
