@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 _SENSITIVE_HEADER_PREFIXES = ("authorization",)
 _SENSITIVE_HEADER_KEYS = {
+    "buildium-webhook-secret",
+    "buildium-webhook-signature",
+    "buildium-webhook-token",
     "x-buildium-hmac-sha256",
     "x-buildium-hmacsha256",
     "x-buildium-signature",

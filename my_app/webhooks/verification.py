@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _SENSITIVE_HEADER_PREFIXES = ("authorization",)
 _SENSITIVE_HEADER_KEYS = {
+    "buildium-webhook-secret",
+    "buildium-webhook-signature",
+    "buildium-webhook-token",
     "x-buildium-hmac-sha256",
     "x-buildium-hmacsha256",
     "x-buildium-signature",
@@ -63,6 +66,8 @@ class _SignatureMetadata:
 
 
 _ACCOUNT_ID_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "buildium-account-id",
+    "buildium-accountid",
     "x-buildium-account-id",
     "x-buildium-accountid",
     "x-account-id",
@@ -74,6 +79,7 @@ _ACCOUNT_ID_BODY_CANDIDATES: Tuple[str, ...] = (
     "AccountId",
 )
 _HMAC_SIGNATURE_HEADERS: Tuple[str, ...] = (
+    "buildium-webhook-signature",
     "x-buildium-hmac-sha256",
     "x-buildium-hmacsha256",
     "x-buildium-signature",
@@ -81,17 +87,32 @@ _HMAC_SIGNATURE_HEADERS: Tuple[str, ...] = (
     "x-hub-signature",
 )
 _TOKEN_SIGNATURE_HEADERS: Tuple[str, ...] = (
+    "buildium-webhook-secret",
+    "buildium-webhook-token",
     "x-buildium-verification-secret",
     "x-buildium-verification-token",
     "x-buildium-webhook-token",
     "x-buildium-webhook-secret",
 )
 _SIGNATURE_TIMESTAMP_HEADERS: Tuple[str, ...] = (
+    "buildium-webhook-timestamp",
     "x-buildium-signature-timestamp",
     "x-buildium-request-timestamp",
     "x-buildium-timestamp",
     "x-buildium-webhook-timestamp",
 )
+
+_STRUCTURED_SIGNATURE_KEYS = {
+    "v1",
+    "sig",
+    "signature",
+    "s",
+    "sha256",
+    "t",
+    "timestamp",
+    "alg",
+    "algorithm",
+}
 
 _SIGNATURE_MAX_AGE_SECONDS = 300
 
@@ -225,30 +246,30 @@ def _parse_signature_header(signature_header: str) -> Tuple[str, Optional[str], 
             if "=" not in segment:
                 continue
             key, value = segment.split("=", 1)
-            structured_pairs[key.strip().lower()] = value.strip()
+            normalized_key = key.strip().lower()
+            if normalized_key not in _STRUCTURED_SIGNATURE_KEYS:
+                continue
+            structured_pairs[normalized_key] = value.strip()
 
-        signature = (
-            structured_pairs.get("v1")
-            or structured_pairs.get("sig")
-            or structured_pairs.get("signature")
-            or structured_pairs.get("s")
-            or structured_pairs.get("sha256")
-            or ""
-        )
-        timestamp = structured_pairs.get("t") or structured_pairs.get("timestamp")
-        algorithm = structured_pairs.get("alg") or structured_pairs.get("algorithm")
+        if structured_pairs:
+            signature = (
+                structured_pairs.get("v1")
+                or structured_pairs.get("sig")
+                or structured_pairs.get("signature")
+                or structured_pairs.get("s")
+                or structured_pairs.get("sha256")
+                or ""
+            )
+            timestamp = structured_pairs.get("t") or structured_pairs.get("timestamp")
+            algorithm = structured_pairs.get("alg") or structured_pairs.get("algorithm")
 
-        if not signature and len(structured_pairs) == 1:
-            # Handle values like "sha256=<signature>" where the only key encodes the
-            # algorithm name and the value is the signature payload.
-            signature = next(iter(structured_pairs.values()))
-            algorithm = next(iter(structured_pairs.keys()))
+            if not signature and len(structured_pairs) == 1:
+                # Handle values like "sha256=<signature>" where the only key encodes the
+                # algorithm name and the value is the signature payload.
+                signature = next(iter(structured_pairs.values()))
+                algorithm = next(iter(structured_pairs.keys()))
 
-        return signature, algorithm, timestamp, structured_pairs
-
-    if "=" in header:
-        algorithm, signature = header.split("=", 1)
-        return signature.strip(), algorithm.strip().lower(), None, {}
+            return signature, algorithm, timestamp, structured_pairs
 
     return header, None, None, {}
 
