@@ -26,6 +26,18 @@ class BuildiumAccountContext:
 
 
 _FIRESTORE_COLLECTION_PATH = "Buildium/buildium_accounts"
+_WEBHOOK_SECRET_METADATA_KEYS = (
+    "webhook_secret",
+    "webhookSecret",
+    "webhook_verification_secret",
+    "webhookVerificationSecret",
+)
+_WEBHOOK_SECRET_NAME_KEYS = (
+    "webhook_secret_name",
+    "webhookSecretName",
+    "webhook_verification_secret_name",
+    "webhookVerificationSecretName",
+)
 
 
 def _access_secret(
@@ -187,18 +199,13 @@ def get_buildium_account_context(
         )
 
     metadata: Dict[str, Any] = snapshot.to_dict() or {}
+    sanitized_metadata = dict(metadata)
 
     api_secret_name = (
         metadata.get("api_secret_name")
         or metadata.get("apiSecretName")
         or metadata.get("api_secret_version_name")
         or metadata.get("apiSecretVersionName")
-    )
-    webhook_secret_name = (
-        metadata.get("webhook_secret_name")
-        or metadata.get("webhookSecretName")
-        or metadata.get("webhook_verification_secret_name")
-        or metadata.get("webhookVerificationSecretName")
     )
 
     api_secret = _access_secret(
@@ -207,12 +214,52 @@ def get_buildium_account_context(
         account_id=account_id,
         secret_type="api_secret",
     )
-    webhook_secret = _access_secret(
-        client=secret_manager_client,
-        secret_name=webhook_secret_name,
-        account_id=account_id,
-        secret_type="webhook_secret",
-    )
+
+    webhook_secret = None
+    webhook_secret_source = "firestore"
+    for key in _WEBHOOK_SECRET_METADATA_KEYS:
+        candidate = metadata.get(key)
+        if candidate is None:
+            continue
+        if not isinstance(candidate, str):
+            logger.error(
+                "Webhook secret stored in Firestore is not a string.",
+                extra={
+                    "account_id": account_id,
+                    "document_path": document_path,
+                    "metadata_key": key,
+                    "metadata_type": type(candidate).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Buildium account webhook secret is invalid.",
+            )
+        if not candidate:
+            # Treat empty strings as missing values and continue searching.
+            continue
+        webhook_secret = candidate
+        sanitized_metadata.pop(key, None)
+        break
+
+    if webhook_secret is None:
+        webhook_secret_source = "secret_manager"
+        webhook_secret_name = None
+        for key in _WEBHOOK_SECRET_NAME_KEYS:
+            value = metadata.get(key)
+            if value:
+                webhook_secret_name = value
+                break
+        webhook_secret = _access_secret(
+            client=secret_manager_client,
+            secret_name=webhook_secret_name,
+            account_id=account_id,
+            secret_type="webhook_secret",
+        )
+    elif webhook_secret_source == "firestore":
+        # Remove any legacy secret name metadata when the direct secret is stored.
+        for key in _WEBHOOK_SECRET_NAME_KEYS:
+            sanitized_metadata.pop(key, None)
 
     logger.info(
         "Resolved Buildium account context.",
@@ -221,12 +268,13 @@ def get_buildium_account_context(
             "document_path": document_path,
             "has_api_secret": bool(api_secret),
             "has_webhook_secret": bool(webhook_secret),
+            "webhook_secret_source": webhook_secret_source,
         },
     )
 
     return BuildiumAccountContext(
         account_id=account_id,
-        metadata=metadata,
+        metadata=sanitized_metadata,
         api_secret=api_secret,
         webhook_secret=webhook_secret,
     )
