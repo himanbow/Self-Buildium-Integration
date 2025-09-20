@@ -19,7 +19,7 @@ all arguments to the module entrypoint.
 The job entrypoint supports additional flags:
 
 * `--account <ACCOUNT_ID>` – explicitly target one or more Buildium accounts.
-* `--all-accounts` – enumerate every account in Firestore (`Buildium/buildium_accounts`).
+* `--all-accounts` – enumerate every account in Firestore (`buildium_accounts`).
 * `--automation` – run a specific automation (`initiation`, `n1increase`). Provide multiple values to run more than one automation.
 * `--event` – emulate a Buildium webhook event (`taskcreated`, `taskstatuschanged`).
 * `--status` – optional status used with `taskstatuschanged` events (defaults to `Completed`).

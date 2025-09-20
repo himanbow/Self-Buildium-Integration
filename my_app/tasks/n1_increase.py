@@ -16,7 +16,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 logger = logging.getLogger(__name__)
 
-FIRESTORE_COLLECTION_PATH = "Buildium/buildium_accounts"
+FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 MAX_PAYLOAD_BYTES = 20 * 1024 * 1024
 
 
