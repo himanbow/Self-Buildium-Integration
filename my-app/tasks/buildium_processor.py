@@ -11,6 +11,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 from typing import Protocol
 
 from ..webhooks.verification import VerifiedBuildiumWebhook
+from .initiation import handle_initiation_automation
+from .n1_increase import handle_n1_increase_automation
 
 logger = logging.getLogger(__name__)
 
@@ -144,44 +146,6 @@ class AutomationHandler(Protocol):
         webhook: Mapping[str, Any],
     ) -> None:
         """Handle a routed automation task."""
-
-
-def handle_initiation_automation(
-    *,
-    account_id: str,
-    api_headers: Mapping[str, str],
-    gl_mapping: Mapping[str, Any],
-    webhook: Mapping[str, Any],
-) -> None:
-    """Process the Initiation automation webhook."""
-
-    logger.info(
-        "Handling Initiation automation task.",
-        extra={
-            "account_id": account_id,
-            "gl_mapping_keys": sorted(gl_mapping.keys()),
-            "header_names": sorted(api_headers.keys()),
-        },
-    )
-
-
-def handle_n1_increase_automation(
-    *,
-    account_id: str,
-    api_headers: Mapping[str, str],
-    gl_mapping: Mapping[str, Any],
-    webhook: Mapping[str, Any],
-) -> None:
-    """Process the N1 Increase automation webhook."""
-
-    logger.info(
-        "Handling N1 Increase automation task.",
-        extra={
-            "account_id": account_id,
-            "gl_mapping_keys": sorted(gl_mapping.keys()),
-            "header_names": sorted(api_headers.keys()),
-        },
-    )
 
 
 _AUTOMATED_TASKS_KEY = "automatedtasks"
