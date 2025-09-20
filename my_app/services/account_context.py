@@ -25,7 +25,7 @@ class BuildiumAccountContext:
     webhook_secret: str
 
 
-_FIRESTORE_COLLECTION_PATH = "Buildium/buildium_accounts"
+_FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 _WEBHOOK_SECRET_METADATA_KEYS = (
     "webhook_secret",
     "webhookSecret",

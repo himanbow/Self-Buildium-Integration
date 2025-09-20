@@ -11,7 +11,7 @@ from urllib import request as urllib_request
 
 logger = logging.getLogger(__name__)
 
-FIRESTORE_COLLECTION_PATH = "Buildium/buildium_accounts"
+FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 AUTOMATED_TASK_CATEGORY_NAME = "Automated Tasks"
 
 
