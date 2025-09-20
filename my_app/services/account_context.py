@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 
+import google.auth
+from google.auth import exceptions as google_auth_exceptions
 from fastapi import HTTPException, status
 
 if TYPE_CHECKING:  # pragma: no cover - imported for static analysis only
@@ -39,6 +42,73 @@ _WEBHOOK_SECRET_NAME_KEYS = (
     "webhookVerificationSecretName",
 )
 
+_SECRET_PROJECT_ENV_VAR = "SECRET_PROJECT_ID"
+
+
+def _get_secret_project_id(*, account_id: str, secret_type: str) -> str:
+    """Resolve the GCP project id that stores Buildium secrets."""
+
+    project_id = os.getenv(_SECRET_PROJECT_ENV_VAR)
+    if project_id:
+        return project_id
+
+    try:
+        _, project_id = google.auth.default()
+    except google_auth_exceptions.DefaultCredentialsError as exc:
+        logger.error(
+            "Unable to determine GCP project id for Buildium secret access.",
+            extra={"account_id": account_id, "secret_type": secret_type},
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Buildium secret storage project is not configured.",
+        ) from exc
+
+    if project_id:
+        return project_id
+
+    logger.error(
+        "Google application default credentials do not specify a project id.",
+        extra={"account_id": account_id, "secret_type": secret_type},
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Buildium secret storage project is not configured.",
+    )
+
+
+def _normalize_secret_resource_name(
+    secret_reference: str, *, account_id: str, secret_type: str
+) -> str:
+    """Ensure the provided secret reference is a full Secret Manager resource name."""
+
+    secret_reference = secret_reference.strip()
+    if secret_reference.startswith("projects/"):
+        return secret_reference
+
+    project_id = _get_secret_project_id(account_id=account_id, secret_type=secret_type)
+
+    if "/versions/" in secret_reference:
+        secret_id, version = secret_reference.split("/versions/", 1)
+    else:
+        secret_id, version = secret_reference, "latest"
+
+    secret_id = secret_id.strip("/")
+    version = version.strip("/") or "latest"
+
+    if not secret_id:
+        logger.error(
+            "Secret identifier is empty after normalization.",
+            extra={"account_id": account_id, "secret_type": secret_type},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Buildium secret configuration is invalid.",
+        )
+
+    return f"projects/{project_id}/secrets/{secret_id}/versions/{version}"
+
 
 def _access_secret(
     *,
@@ -62,8 +132,14 @@ def _access_secret(
             detail="Buildium account configuration is incomplete.",
         )
 
+    normalized_secret_name = _normalize_secret_resource_name(
+        secret_name,
+        account_id=account_id,
+        secret_type=secret_type,
+    )
+
     try:
-        response = client.access_secret_version(request={"name": secret_name})
+        response = client.access_secret_version(request={"name": normalized_secret_name})
     except (google_exceptions.PermissionDenied, google_exceptions.Forbidden) as exc:
         message = "Access to Buildium secret in Google Secret Manager was denied."
         logger.error(
@@ -71,7 +147,7 @@ def _access_secret(
             extra={
                 "account_id": account_id,
                 "secret_type": secret_type,
-                "secret_name": secret_name,
+                "secret_name": normalized_secret_name,
             },
             exc_info=exc,
         )
@@ -86,7 +162,7 @@ def _access_secret(
             extra={
                 "account_id": account_id,
                 "secret_type": secret_type,
-                "secret_name": secret_name,
+                "secret_name": normalized_secret_name,
             },
             exc_info=exc,
         )
@@ -101,7 +177,7 @@ def _access_secret(
             extra={
                 "account_id": account_id,
                 "secret_type": secret_type,
-                "secret_name": secret_name,
+                "secret_name": normalized_secret_name,
             },
         )
         raise HTTPException(
@@ -117,7 +193,7 @@ def _access_secret(
             extra={
                 "account_id": account_id,
                 "secret_type": secret_type,
-                "secret_name": secret_name,
+                "secret_name": normalized_secret_name,
             },
         )
         raise HTTPException(
