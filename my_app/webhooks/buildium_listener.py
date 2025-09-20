@@ -132,6 +132,7 @@ def _deserialize_verified_webhook_task(payload: Mapping[str, Any]) -> VerifiedBu
 
 @app.post("/webhooks/buildium", status_code=status.HTTP_200_OK)
 async def handle_buildium_webhook(request: Request) -> Response:
+    logging.debug("Request received: method=%s path=%s", request.method, request.path)
     """Receive a webhook call from Buildium, verify it, and enqueue processing."""
 
     raw_body = await request.body()
