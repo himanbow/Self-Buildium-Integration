@@ -26,6 +26,20 @@ if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
 
 logger = logging.getLogger(__name__)
 
+_SENSITIVE_HEADER_PREFIXES = ("authorization",)
+_SENSITIVE_HEADER_KEYS = {
+    "x-buildium-hmac-sha256",
+    "x-buildium-hmacsha256",
+    "x-buildium-signature",
+    "x-buildium-verification-secret",
+    "x-buildium-verification-token",
+    "x-buildium-webhook-token",
+    "x-buildium-webhook-secret",
+    "x-hub-signature",
+    "x-hub-signature-256",
+}
+_BODY_PREVIEW_LIMIT = 2048
+
 
 @dataclass(frozen=True)
 class VerifiedBuildiumWebhook:
@@ -42,6 +56,7 @@ class VerifiedBuildiumWebhook:
 class _SignatureMetadata:
     """Captured signature header details discovered during extraction."""
 
+    header_name: str
     header_value: str
     scheme: str
     timestamp: Optional[str] = None
@@ -83,6 +98,38 @@ _SIGNATURE_MAX_AGE_SECONDS = 300
 
 def _normalize_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
     return {key.lower(): value for key, value in headers.items()}
+
+
+def _summarize_headers_for_logging(headers: Mapping[str, str]) -> Dict[str, str]:
+    sanitized: Dict[str, str] = {}
+    for key, value in headers.items():
+        normalized_key = key.lower()
+        if normalized_key.startswith(_SENSITIVE_HEADER_PREFIXES) or normalized_key in _SENSITIVE_HEADER_KEYS:
+            sanitized[normalized_key] = "<redacted>"
+        else:
+            sanitized[normalized_key] = value
+    return sanitized
+
+
+def _preview_body_for_logging(body: bytes, *, limit: int = _BODY_PREVIEW_LIMIT) -> str:
+    if not body:
+        return ""
+
+    decoded = body.decode("utf-8", "replace")
+    if len(decoded) <= limit:
+        return decoded
+
+    return f"{decoded[:limit]}… <truncated {len(decoded) - limit} characters>"
+
+
+def _summarize_signature_metadata(metadata: _SignatureMetadata) -> Dict[str, Any]:
+    return {
+        "scheme": metadata.scheme,
+        "header_name": metadata.header_name,
+        "timestamp": metadata.timestamp,
+        "has_value": bool(metadata.header_value),
+        "value_length": len(metadata.header_value or ""),
+    }
 
 
 def _lookup_header(headers: Mapping[str, str], candidates: Sequence[str]) -> Optional[str]:
@@ -137,13 +184,24 @@ def _extract_signature(
 
     timestamp = _lookup_header(normalized_headers, _SIGNATURE_TIMESTAMP_HEADERS)
 
-    signature = _lookup_header(normalized_headers, _HMAC_SIGNATURE_HEADERS)
-    if signature:
-        return _SignatureMetadata(header_value=signature, scheme="hmac", timestamp=timestamp)
+    for candidate in _HMAC_SIGNATURE_HEADERS:
+        signature = normalized_headers.get(candidate)
+        if signature:
+            return _SignatureMetadata(
+                header_name=candidate,
+                header_value=signature,
+                scheme="hmac",
+                timestamp=timestamp,
+            )
 
-    signature = _lookup_header(normalized_headers, _TOKEN_SIGNATURE_HEADERS)
-    if signature:
-        return _SignatureMetadata(header_value=signature, scheme="token")
+    for candidate in _TOKEN_SIGNATURE_HEADERS:
+        signature = normalized_headers.get(candidate)
+        if signature:
+            return _SignatureMetadata(
+                header_name=candidate,
+                header_value=signature,
+                scheme="token",
+            )
 
     return None
 
@@ -337,27 +395,72 @@ async def verify_buildium_webhook(
 ) -> VerifiedBuildiumWebhook:
     """Validate webhook authenticity and resolve the associated account context."""
 
+    headers_for_logging = _summarize_headers_for_logging(envelope.headers)
+    body_preview_for_logging = _preview_body_for_logging(envelope.body)
+
     account_id = _extract_account_id(
         headers=envelope.headers,
         parsed_body=envelope.parsed_body,
         body=envelope.body,
     )
     if not account_id:
-        logger.warning("Received Buildium webhook without an account identifier.")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Unable to resolve Buildium account from webhook payload.",
+                extra={
+                    "headers": headers_for_logging,
+                    "body_preview": body_preview_for_logging,
+                    "parsed_body_type": type(envelope.parsed_body).__name__
+                    if envelope.parsed_body is not None
+                    else None,
+                },
+            )
+
+        logger.warning(
+            "Received Buildium webhook without an account identifier.",
+            extra={
+                "headers": headers_for_logging,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Buildium webhook is missing the account identifier.",
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Resolved Buildium account identifier from webhook payload.",
+            extra={
+                "account_id": account_id,
+                "headers": headers_for_logging,
+                "body_preview": body_preview_for_logging,
+                "parsed_body_type": type(envelope.parsed_body).__name__
+                if envelope.parsed_body is not None
+                else None,
+            },
         )
 
     signature_metadata = _extract_signature(headers=envelope.headers)
     if not signature_metadata:
         logger.warning(
             "Received Buildium webhook without a verification signature.",
-            extra={"account_id": account_id},
+            extra={
+                "account_id": account_id,
+                "headers": headers_for_logging,
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Buildium webhook signature header is required.",
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Buildium webhook signature metadata captured.",
+            extra={
+                "account_id": account_id,
+                "signature_details": _summarize_signature_metadata(signature_metadata),
+            },
         )
 
     loop = asyncio.get_running_loop()
@@ -393,6 +496,7 @@ async def verify_buildium_webhook(
         extra={
             "account_id": account_id,
             "verification_scheme": signature_metadata.scheme,
+            "signature_details": _summarize_signature_metadata(signature_metadata),
         },
     )
 
