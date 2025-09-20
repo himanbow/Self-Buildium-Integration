@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip \
         "uvicorn>=0.22.0,<1" \
         "google-cloud-firestore>=2.11.0" \
         "google-cloud-secret-manager>=2.11.0" \
+        "google-cloud-tasks>=2.10.0" \
         "google-api-core>=2.11.0" \
         "google-cloud-core>=2.3.0" \
         "pydantic>=2.0.0,<3" \

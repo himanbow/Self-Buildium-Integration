@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import multiprocessing
@@ -13,9 +14,11 @@ import uvicorn
 
 from ..tasks.buildium_processor import (
     BuildiumProcessorError,
+    BuildiumWebhookProcessor,
     enqueue_buildium_webhook,
 )
-from .verification import verify_buildium_webhook
+from ..services.account_context import BuildiumAccountContext
+from .verification import VerifiedBuildiumWebhook, verify_buildium_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,65 @@ def _extract_metadata(
                 break
 
     return metadata
+
+
+def _deserialize_verified_webhook_task(payload: Mapping[str, Any]) -> VerifiedBuildiumWebhook:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Task payload must be a JSON object.")
+
+    raw_account_id = payload.get("account_id")
+    if not isinstance(raw_account_id, str) or not raw_account_id.strip():
+        raise ValueError("Task payload is missing the Buildium account identifier.")
+    account_id = raw_account_id.strip()
+
+    account_context_payload = payload.get("account_context")
+    if not isinstance(account_context_payload, Mapping):
+        raise ValueError("Task payload is missing the account context block.")
+
+    metadata_block = account_context_payload.get("metadata")
+    metadata = dict(metadata_block) if isinstance(metadata_block, Mapping) else {}
+
+    account_context = BuildiumAccountContext(
+        account_id=str(account_context_payload.get("account_id") or account_id),
+        metadata=metadata,
+        api_secret=str(account_context_payload.get("api_secret") or ""),
+        webhook_secret=str(account_context_payload.get("webhook_secret") or ""),
+    )
+
+    envelope_payload = payload.get("envelope")
+    if not isinstance(envelope_payload, Mapping):
+        raise ValueError("Task payload is missing the webhook envelope block.")
+
+    headers_block = envelope_payload.get("headers")
+    headers = (
+        {str(key): str(value) for key, value in headers_block.items()}
+        if isinstance(headers_block, Mapping)
+        else {}
+    )
+
+    body_encoded = envelope_payload.get("body") or ""
+    if body_encoded:
+        try:
+            body = base64.b64decode(body_encoded.encode("ascii"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("Task payload contains an invalid base64-encoded body.") from exc
+    else:
+        body = b""
+
+    parsed_body = envelope_payload.get("parsed_body")
+
+    envelope = BuildiumWebhookEnvelope(headers=headers, body=body, parsed_body=parsed_body)
+
+    signature = payload.get("signature")
+    verification_scheme = payload.get("verification_scheme")
+
+    return VerifiedBuildiumWebhook(
+        account_context=account_context,
+        account_id=account_id,
+        envelope=envelope,
+        signature=str(signature) if signature is not None else "",
+        verification_scheme=str(verification_scheme) if verification_scheme is not None else "",
+    )
 
 
 @app.post("/webhooks/buildium", status_code=status.HTTP_200_OK)
@@ -141,6 +203,60 @@ async def handle_buildium_webhook(request: Request) -> Response:
     return Response(status_code=status.HTTP_200_OK)
 
 
+@app.post("/tasks/buildium-webhook", status_code=status.HTTP_204_NO_CONTENT)
+async def handle_buildium_webhook_task(request: Request) -> Response:
+    """Execute queued Buildium webhook work from Cloud Tasks."""
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Task payload must be valid JSON.",
+        )
+
+    try:
+        verified_webhook = _deserialize_verified_webhook_task(payload)
+    except ValueError as exc:
+        logger.warning(
+            "Rejected Buildium webhook task due to invalid payload.",
+            extra={"error": str(exc)},
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception("Failed to deserialize Buildium webhook task payload.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Task payload could not be parsed.",
+        ) from exc
+
+    processor = BuildiumWebhookProcessor(verified_webhook)
+
+    logger.info(
+        "Processing Buildium webhook task from Cloud Tasks.",
+        extra=processor.metadata,
+    )
+
+    try:
+        await processor.run()
+    except Exception as exc:
+        logger.exception(
+            "Buildium webhook task processing failed.",
+            extra=processor.metadata,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process Buildium webhook task.",
+        ) from exc
+
+    logger.info(
+        "Completed Buildium webhook task from Cloud Tasks.",
+        extra=processor.metadata,
+    )
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 def run(host: str = "0.0.0.0", port: int = 8080, workers: Optional[int] = None) -> None:
     """Launch the webhook listener with a concurrent Uvicorn server."""
 
@@ -152,4 +268,10 @@ def run(host: str = "0.0.0.0", port: int = 8080, workers: Optional[int] = None) 
     uvicorn.run(app, host=host, port=port, workers=workers, log_level="info")
 
 
-__all__ = ["app", "run", "BuildiumWebhookEnvelope"]
+__all__ = [
+    "app",
+    "run",
+    "BuildiumWebhookEnvelope",
+    "handle_buildium_webhook",
+    "handle_buildium_webhook_task",
+]

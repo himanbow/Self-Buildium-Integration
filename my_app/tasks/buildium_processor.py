@@ -6,15 +6,47 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from typing import Protocol
+
+from google.api_core import exceptions as google_exceptions
+from google.cloud import tasks_v2
 
 from ..webhooks.verification import VerifiedBuildiumWebhook
 from .initiation import handle_initiation_automation
 from .n1_increase import handle_n1_increase_automation
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CLOUD_TASKS_QUEUE = "buildium-webhooks"
+_DEFAULT_CLOUD_TASKS_LOCATION = "us-central1"
+_DEFAULT_TASK_HANDLER_URL = "http://localhost:8080/tasks/buildium-webhook"
+
+CLOUD_TASKS_QUEUE_ENV = "CLOUD_TASKS_QUEUE"
+CLOUD_TASKS_LOCATION_ENV = "CLOUD_TASKS_LOCATION"
+TASK_HANDLER_URL_ENV = "TASK_HANDLER_URL"
+
+_PROJECT_ID_ENV_CANDIDATES: Tuple[str, ...] = (
+    "GOOGLE_CLOUD_PROJECT",
+    "CLOUD_RUN_PROJECT",
+    "GCP_PROJECT",
+    "GCLOUD_PROJECT",
+    "PROJECT_ID",
+)
+
+
+def _get_cloud_tasks_queue() -> str:
+    return os.getenv(CLOUD_TASKS_QUEUE_ENV, _DEFAULT_CLOUD_TASKS_QUEUE)
+
+
+def _get_cloud_tasks_location() -> str:
+    return os.getenv(CLOUD_TASKS_LOCATION_ENV, _DEFAULT_CLOUD_TASKS_LOCATION)
+
+
+def _get_task_handler_url() -> str:
+    return os.getenv(TASK_HANDLER_URL_ENV, _DEFAULT_TASK_HANDLER_URL)
 
 
 class BuildiumProcessorError(RuntimeError):
@@ -134,6 +166,44 @@ def _extract_gl_mapping(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
             if mapping:
                 return mapping
     return {}
+
+
+def _resolve_project_id() -> Optional[str]:
+    for env_name in _PROJECT_ID_ENV_CANDIDATES:
+        value = os.getenv(env_name)
+        if value:
+            return value
+    return None
+
+
+def _serialize_verified_webhook(verified_webhook: VerifiedBuildiumWebhook) -> Dict[str, Any]:
+    headers: Mapping[str, Any]
+    if isinstance(verified_webhook.envelope.headers, Mapping):
+        headers = {str(key): str(value) for key, value in verified_webhook.envelope.headers.items()}
+    else:  # pragma: no cover - defensive guard
+        headers = {}
+
+    body_bytes = verified_webhook.envelope.body or b""
+    body_encoded = base64.b64encode(body_bytes).decode("ascii") if body_bytes else ""
+
+    parsed_body = verified_webhook.envelope.parsed_body
+
+    return {
+        "account_id": verified_webhook.account_id,
+        "verification_scheme": verified_webhook.verification_scheme,
+        "signature": verified_webhook.signature,
+        "account_context": {
+            "account_id": verified_webhook.account_context.account_id,
+            "metadata": dict(verified_webhook.account_context.metadata),
+            "api_secret": verified_webhook.account_context.api_secret,
+            "webhook_secret": verified_webhook.account_context.webhook_secret,
+        },
+        "envelope": {
+            "headers": headers,
+            "body": body_encoded,
+            "parsed_body": parsed_body,
+        },
+    }
 
 
 class AutomationHandler(Protocol):
@@ -399,42 +469,85 @@ class BuildiumWebhookProcessor:
         )
 
 
-_inflight_tasks: Set[asyncio.Task[None]] = set()
-
-
-def _on_task_done(task: asyncio.Task[None], *, metadata: Mapping[str, Any]) -> None:
-    _inflight_tasks.discard(task)
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logger.info("Buildium webhook processor task cancelled after dispatch.", extra=metadata)
-    except Exception:
-        logger.exception("Buildium webhook processor task failed.", extra=metadata)
-
-
 def enqueue_buildium_webhook(
     verified_webhook: VerifiedBuildiumWebhook,
     *,
-    loop: Optional[asyncio.AbstractEventLoop] = None,
-) -> asyncio.Task[None]:
-    """Schedule asynchronous processing for the verified webhook payload."""
+    client: Optional[tasks_v2.CloudTasksClient] = None,
+) -> Any:
+    """Serialize the verified webhook and enqueue processing via Cloud Tasks."""
 
-    if loop is None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as exc:  # pragma: no cover - defensive
-            raise BuildiumProcessorError("No running event loop is available.") from exc
+    queue_name = _get_cloud_tasks_queue().strip()
+    location = _get_cloud_tasks_location().strip()
+    handler_url = _get_task_handler_url().strip()
+    project_id = _resolve_project_id()
 
-    processor = BuildiumWebhookProcessor(verified_webhook)
-    task = loop.create_task(processor.run())
-    task.set_name(f"buildium-webhook-{verified_webhook.account_id}")
-    _inflight_tasks.add(task)
-    task.add_done_callback(lambda t, metadata=processor.metadata: _on_task_done(t, metadata=metadata))
+    metadata: Dict[str, Any] = {
+        "account_id": verified_webhook.account_id,
+        "queue": queue_name or _DEFAULT_CLOUD_TASKS_QUEUE,
+        "location": location or _DEFAULT_CLOUD_TASKS_LOCATION,
+    }
+
+    if not project_id:
+        message = "Google Cloud project identifier is not configured."
+        logger.error(message, extra=metadata)
+        raise BuildiumProcessorError(message)
+
+    if not queue_name:
+        message = "Cloud Tasks queue name is not configured."
+        logger.error(message, extra=metadata)
+        raise BuildiumProcessorError(message)
+
+    if not location:
+        message = "Cloud Tasks location is not configured."
+        logger.error(message, extra=metadata)
+        raise BuildiumProcessorError(message)
+
+    if not handler_url:
+        message = "Task handler URL is not configured."
+        logger.error(message, extra=metadata)
+        raise BuildiumProcessorError(message)
+
+    if client is None:
+        client = tasks_v2.CloudTasksClient()
+
+    try:
+        parent = client.queue_path(project_id, location, queue_name)
+    except Exception as exc:
+        message = "Unable to resolve Cloud Tasks queue path."
+        logger.exception(message, extra=metadata)
+        raise BuildiumProcessorError(message) from exc
+
+    serialized = _serialize_verified_webhook(verified_webhook)
+    body = json.dumps(serialized, default=str).encode("utf-8")
+    task: Dict[str, Any] = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": handler_url,
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+        }
+    }
+
+    request = {"parent": parent, "task": task}
+
+    try:
+        response = client.create_task(request=request)
+    except google_exceptions.GoogleAPICallError as exc:
+        message = "Failed to enqueue Buildium webhook task via Cloud Tasks."
+        logger.exception(message, extra=metadata)
+        raise BuildiumProcessorError(message) from exc
+    except Exception as exc:  # pragma: no cover - defensive guard
+        message = "Unexpected error while enqueuing Buildium webhook task."
+        logger.exception(message, extra=metadata)
+        raise BuildiumProcessorError(message) from exc
+
+    task_name = getattr(response, "name", None)
     logger.info(
-        "Enqueued Buildium webhook processor task.",
-        extra={**processor.metadata, "inflight_processors": len(_inflight_tasks)},
+        "Enqueued Buildium webhook task in Cloud Tasks.",
+        extra={**metadata, "task_name": task_name},
     )
-    return task
+
+    return response
 
 
 __all__ = [
@@ -442,4 +555,7 @@ __all__ = [
     "BuildiumProcessingContext",
     "BuildiumWebhookProcessor",
     "enqueue_buildium_webhook",
+    "CLOUD_TASKS_QUEUE_ENV",
+    "CLOUD_TASKS_LOCATION_ENV",
+    "TASK_HANDLER_URL_ENV",
 ]
