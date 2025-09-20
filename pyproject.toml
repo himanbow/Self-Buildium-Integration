@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "self-buildium-integration"
+version = "0.1.0"
+description = "Buildium webhook integration services"
+requires-python = ">=3.9"
+authors = [{name = "Self-Buildium Team"}]
+dependencies = [
+    "fastapi>=0.103.0,<1",
+    "uvicorn>=0.22.0,<1",
+    "google-cloud-firestore>=2.11.0",
+    "google-cloud-secret-manager>=2.11.0",
+    "google-api-core>=2.11.0",
+    "google-cloud-core>=2.3.0",
+    "pydantic>=2.0.0,<3",
+    "python-dateutil>=2.8.0",
+    "typing-extensions>=4.6.0",
+    "urllib3>=1.26.0,<2.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["my_app*"]
+exclude = ["my_app.tests*"]

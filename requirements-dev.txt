@@ -1,0 +1,3 @@
+# Development and testing dependencies
+-e .
+pytest>=7.0
