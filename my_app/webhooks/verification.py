@@ -63,6 +63,7 @@ class _SignatureMetadata:
     header_value: str
     scheme: str
     timestamp: Optional[str] = None
+    timestamp_header_name: Optional[str] = None
 
 
 _ACCOUNT_ID_HEADER_CANDIDATES: Tuple[str, ...] = (
@@ -148,17 +149,20 @@ def _summarize_signature_metadata(metadata: _SignatureMetadata) -> Dict[str, Any
         "scheme": metadata.scheme,
         "header_name": metadata.header_name,
         "timestamp": metadata.timestamp,
+        "timestamp_header_name": metadata.timestamp_header_name,
         "has_value": bool(metadata.header_value),
         "value_length": len(metadata.header_value or ""),
     }
 
 
-def _lookup_header(headers: Mapping[str, str], candidates: Sequence[str]) -> Optional[str]:
+def _lookup_header(
+    headers: Mapping[str, str], candidates: Sequence[str]
+) -> Tuple[Optional[str], Optional[str]]:
     for candidate in candidates:
         value = headers.get(candidate)
         if value:
-            return value
-    return None
+            return value, candidate
+    return None, None
 
 
 def _extract_account_id(
@@ -168,32 +172,113 @@ def _extract_account_id(
     body: bytes,
 ) -> Optional[str]:
     normalized_headers = _normalize_headers(headers)
-    header_account_id = _lookup_header(normalized_headers, _ACCOUNT_ID_HEADER_CANDIDATES)
+    header_account_id, header_key = _lookup_header(
+        normalized_headers, _ACCOUNT_ID_HEADER_CANDIDATES
+    )
     if header_account_id:
-        return header_account_id.strip()
+        account_id = header_account_id.strip()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Account identifier resolved from webhook headers.",
+                extra={
+                    "account_id_candidate": account_id,
+                    "header_key": header_key,
+                    "header_value_raw": header_account_id,
+                    "headers_raw": dict(normalized_headers),
+                },
+            )
+        return account_id
 
     if isinstance(parsed_body, Mapping):
         for key in _ACCOUNT_ID_BODY_CANDIDATES:
             value = parsed_body.get(key)
             if value:
-                return str(value)
+                account_id = str(value)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Account identifier resolved from webhook body field.",
+                        extra={
+                            "account_id_candidate": account_id,
+                            "body_key": key,
+                            "parsed_body": parsed_body,
+                        },
+                    )
+                return account_id
         account_block = parsed_body.get("account")
         if isinstance(account_block, Mapping):
             for key in _ACCOUNT_ID_BODY_CANDIDATES:
                 value = account_block.get(key)
                 if value:
-                    return str(value)
+                    account_id = str(value)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Account identifier resolved from webhook account block.",
+                            extra={
+                                "account_id_candidate": account_id,
+                                "account_block_key": key,
+                                "account_block": account_block,
+                            },
+                        )
+                    return account_id
     else:
         try:
             decoded = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             decoded = None
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Failed to decode webhook body for account identifier lookup.",
+                    extra={
+                        "decode_error": str(exc),
+                        "raw_body": body.decode("utf-8", "replace"),
+                    },
+                )
         if isinstance(decoded, Mapping):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Decoded webhook body for account identifier lookup.",
+                    extra={"decoded_body": decoded},
+                )
             for key in _ACCOUNT_ID_BODY_CANDIDATES:
                 value = decoded.get(key)
                 if value:
-                    return str(value)
+                    account_id = str(value)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Account identifier resolved from decoded body payload.",
+                            extra={
+                                "account_id_candidate": account_id,
+                                "body_key": key,
+                                "decoded_body": decoded,
+                            },
+                        )
+                    return account_id
+            account_block = decoded.get("account")
+            if isinstance(account_block, Mapping):
+                for key in _ACCOUNT_ID_BODY_CANDIDATES:
+                    value = account_block.get(key)
+                    if value:
+                        account_id = str(value)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "Account identifier resolved from decoded account block.",
+                                extra={
+                                    "account_id_candidate": account_id,
+                                    "account_block_key": key,
+                                    "account_block": account_block,
+                                },
+                            )
+                        return account_id
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Failed to extract Buildium account identifier from webhook payload.",
+            extra={
+                "headers_raw": dict(normalized_headers),
+                "body_raw": body.decode("utf-8", "replace"),
+                "parsed_body": parsed_body,
+            },
+        )
     return None
 
 
@@ -203,7 +288,9 @@ def _extract_signature(
 ) -> Optional[_SignatureMetadata]:
     normalized_headers = _normalize_headers(headers)
 
-    timestamp = _lookup_header(normalized_headers, _SIGNATURE_TIMESTAMP_HEADERS)
+    timestamp, timestamp_header_name = _lookup_header(
+        normalized_headers, _SIGNATURE_TIMESTAMP_HEADERS
+    )
 
     for candidate in _HMAC_SIGNATURE_HEADERS:
         signature = normalized_headers.get(candidate)
@@ -213,6 +300,7 @@ def _extract_signature(
                 header_value=signature,
                 scheme="hmac",
                 timestamp=timestamp,
+                timestamp_header_name=timestamp_header_name,
             )
 
     for candidate in _TOKEN_SIGNATURE_HEADERS:
@@ -222,6 +310,8 @@ def _extract_signature(
                 header_name=candidate,
                 header_value=signature,
                 scheme="token",
+                timestamp=timestamp,
+                timestamp_header_name=timestamp_header_name,
             )
 
     return None
@@ -282,6 +372,21 @@ def _verify_hmac_signature(
     account_id: str,
     timestamp: Optional[str] = None,
 ) -> str:
+    body_text_for_logging = body.decode("utf-8", "replace")
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Starting Buildium webhook HMAC verification.",
+            extra={
+                "account_id": account_id,
+                "provided_signature_raw": signature_header,
+                "webhook_secret": webhook_secret,
+                "body_length": len(body),
+                "body_raw": body_text_for_logging,
+                "timestamp_header": timestamp,
+            },
+        )
+
     if not webhook_secret:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -289,7 +394,28 @@ def _verify_hmac_signature(
         )
 
     provided_signature = signature_header.strip()
-    extracted_signature, algorithm, embedded_timestamp, _ = _parse_signature_header(provided_signature)
+    (
+        extracted_signature,
+        algorithm,
+        embedded_timestamp,
+        structured_pairs,
+    ) = _parse_signature_header(provided_signature)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Parsed Buildium webhook signature header.",
+            extra={
+                "account_id": account_id,
+                "provided_signature_stripped": provided_signature,
+                "extracted_signature": extracted_signature,
+                "algorithm_hint": algorithm,
+                "embedded_timestamp": embedded_timestamp,
+                "structured_signature_pairs": dict(structured_pairs),
+                "timestamp_header": timestamp,
+                "webhook_secret": webhook_secret,
+            },
+        )
+
     if extracted_signature:
         provided_signature = extracted_signature
 
@@ -297,6 +423,16 @@ def _verify_hmac_signature(
 
     if algorithm:
         normalized_algorithm = algorithm.lower()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Normalized Buildium webhook signature algorithm.",
+                extra={
+                    "account_id": account_id,
+                    "algorithm_hint": algorithm,
+                    "normalized_algorithm": normalized_algorithm,
+                    "webhook_secret": webhook_secret,
+                },
+            )
         if normalized_algorithm not in {"sha256", "hmac-sha256", "hmac_sha256"}:
             logger.warning(
                 "Unsupported Buildium webhook signature algorithm.",
@@ -316,6 +452,17 @@ def _verify_hmac_signature(
     ]
 
     if candidate_timestamp:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Evaluating Buildium webhook HMAC timestamp.",
+                extra={
+                    "account_id": account_id,
+                    "candidate_timestamp": candidate_timestamp,
+                    "header_timestamp": timestamp,
+                    "embedded_timestamp": embedded_timestamp,
+                    "webhook_secret": webhook_secret,
+                },
+            )
         timestamp_value = candidate_timestamp.strip()
         if not timestamp_value:
             candidate_timestamp = None
@@ -346,7 +493,7 @@ def _verify_hmac_signature(
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Buildium webhook signature timestamp is outside the tolerance window.",
-                )
+            )
 
             timestamp_bytes = f"{timestamp_int}.".encode("utf-8")
             message_digests.append(
@@ -356,6 +503,15 @@ def _verify_hmac_signature(
                     hashlib.sha256,
                 ).digest()
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Generated timestamp-influenced HMAC digest candidate.",
+                    extra={
+                        "account_id": account_id,
+                        "timestamp_int": timestamp_int,
+                        "webhook_secret": webhook_secret,
+                    },
+                )
 
     expected_signatures = set()
     for digest in message_digests:
@@ -369,9 +525,45 @@ def _verify_hmac_signature(
         expected_signatures.add(base64_url_signature)
         expected_signatures.add(base64_url_signature.rstrip("="))
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Computed expected Buildium webhook HMAC signatures.",
+            extra={
+                "account_id": account_id,
+                "expected_signatures": sorted(expected_signatures),
+                "message_digest_count": len(message_digests),
+                "webhook_secret": webhook_secret,
+            },
+        )
+
     for expected_signature in expected_signatures:
         if expected_signature and hmac.compare_digest(provided_signature, expected_signature):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Buildium webhook HMAC signature matched expected digest.",
+                    extra={
+                        "account_id": account_id,
+                        "provided_signature": provided_signature,
+                        "matched_signature": expected_signature,
+                        "expected_signatures": sorted(expected_signatures),
+                        "webhook_secret": webhook_secret,
+                    },
+                )
             return expected_signature
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Buildium webhook HMAC signature mismatch.",
+            extra={
+                "account_id": account_id,
+                "provided_signature": provided_signature,
+                "expected_signatures": sorted(expected_signatures),
+                "webhook_secret": webhook_secret,
+                "body_raw": body_text_for_logging,
+                "timestamp_header": timestamp,
+                "embedded_timestamp": embedded_timestamp,
+            },
+        )
 
     logger.warning(
         "Buildium webhook signature verification failed.",
@@ -389,6 +581,16 @@ def _verify_token_signature(
     webhook_secret: str,
     account_id: str,
 ) -> str:
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Starting Buildium webhook token verification.",
+            extra={
+                "account_id": account_id,
+                "provided_signature_raw": signature_header,
+                "webhook_secret": webhook_secret,
+            },
+        )
+
     if not webhook_secret:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -396,6 +598,15 @@ def _verify_token_signature(
         )
 
     if signature_header.strip() != webhook_secret:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Buildium webhook token mismatch detected.",
+                extra={
+                    "account_id": account_id,
+                    "provided_signature": signature_header.strip(),
+                    "webhook_secret": webhook_secret,
+                },
+            )
         logger.warning(
             "Buildium webhook token verification failed.",
             extra={"account_id": account_id},
@@ -403,6 +614,16 @@ def _verify_token_signature(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Buildium webhook verification token did not match.",
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Buildium webhook token verification succeeded.",
+            extra={
+                "account_id": account_id,
+                "provided_signature": signature_header.strip(),
+                "webhook_secret": webhook_secret,
+            },
         )
 
     return webhook_secret
@@ -416,8 +637,24 @@ async def verify_buildium_webhook(
 ) -> VerifiedBuildiumWebhook:
     """Validate webhook authenticity and resolve the associated account context."""
 
+    raw_headers_for_logging = {str(key): str(value) for key, value in envelope.headers.items()}
+    body_raw_for_logging = envelope.body.decode("utf-8", "replace")
     headers_for_logging = _summarize_headers_for_logging(envelope.headers)
     body_preview_for_logging = _preview_body_for_logging(envelope.body)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Starting Buildium webhook verification.",
+            extra={
+                "headers_raw": raw_headers_for_logging,
+                "body_raw": body_raw_for_logging,
+                "body_length": len(envelope.body or b""),
+                "parsed_body": envelope.parsed_body,
+                "parsed_body_type": type(envelope.parsed_body).__name__
+                if envelope.parsed_body is not None
+                else None,
+            },
+        )
 
     account_id = _extract_account_id(
         headers=envelope.headers,
@@ -463,6 +700,15 @@ async def verify_buildium_webhook(
 
     signature_metadata = _extract_signature(headers=envelope.headers)
     if not signature_metadata:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "No Buildium webhook signature header found.",
+                extra={
+                    "account_id": account_id,
+                    "headers_raw": raw_headers_for_logging,
+                    "body_raw": body_raw_for_logging,
+                },
+            )
         logger.warning(
             "Received Buildium webhook without a verification signature.",
             extra={
@@ -481,6 +727,10 @@ async def verify_buildium_webhook(
             extra={
                 "account_id": account_id,
                 "signature_details": _summarize_signature_metadata(signature_metadata),
+                "signature_header_name": signature_metadata.header_name,
+                "signature_header_value": signature_metadata.header_value,
+                "signature_timestamp": signature_metadata.timestamp,
+                "signature_timestamp_header": signature_metadata.timestamp_header_name,
             },
         )
 
@@ -496,6 +746,20 @@ async def verify_buildium_webhook(
         account_context = await loop.run_in_executor(None, resolver)
     else:
         account_context = resolver()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Resolved Buildium account context for verification.",
+            extra={
+                "account_id": account_id,
+                "account_context": {
+                    "account_id": account_context.account_id,
+                    "metadata": dict(account_context.metadata),
+                    "api_secret": account_context.api_secret,
+                    "webhook_secret": account_context.webhook_secret,
+                },
+            },
+        )
 
     if signature_metadata.scheme == "hmac":
         signature = _verify_hmac_signature(
@@ -520,6 +784,20 @@ async def verify_buildium_webhook(
             "signature_details": _summarize_signature_metadata(signature_metadata),
         },
     )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Buildium webhook signature verification completed.",
+            extra={
+                "account_id": account_id,
+                "verification_scheme": signature_metadata.scheme,
+                "provided_signature": signature_metadata.header_value,
+                "matched_signature": signature,
+                "webhook_secret": account_context.webhook_secret,
+                "signature_timestamp": signature_metadata.timestamp,
+                "signature_timestamp_header": signature_metadata.timestamp_header_name,
+            },
+        )
 
     return VerifiedBuildiumWebhook(
         account_context=account_context,
