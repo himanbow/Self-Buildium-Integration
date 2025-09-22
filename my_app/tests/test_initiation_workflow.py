@@ -118,7 +118,14 @@ def test_handle_initiation_persists_metadata_and_creates_task() -> None:
 
     assert persisted["automated_tasks_category_id"] == "2"
     assert persisted["company"] == {"name": "Example PM", "contact": "pm@example.com"}
-    assert len(persisted["gl_accounts"]) == 2
+    gl_accounts = persisted["gl_accounts"]
+    assert gl_accounts == [
+        {"id": "1", "name": "Rent Income"},
+        {"id": "2", "name": "Parking Income"},
+    ]
+    for account in gl_accounts:
+        assert set(account.keys()) == {"id", "name"}
+        assert isinstance(account["id"], str)
     assert persisted["gl_mapping"] == {"4000": "Income"}
     assert persisted["document_templates"][0]["name"] == "N1 Template"
 
@@ -127,3 +134,4 @@ def test_handle_initiation_persists_metadata_and_creates_task() -> None:
     assert task["category_id"] == "2"
     assert "logo" in task["description"].lower()
     assert "gl" in task["description"].lower()
+    assert "rent income" in task["description"].lower()
