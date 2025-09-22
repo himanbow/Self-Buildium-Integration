@@ -142,10 +142,16 @@ def test_main_invokes_run_job(monkeypatch: pytest.MonkeyPatch) -> None:
     firestore_client = FakeFirestoreClient(["acct-2"])
     secret_client = SimpleNamespace(name="secrets")
 
+    recorded_client_args: Dict[str, Any] = {}
+
+    def fake_firestore_client(*, database: str) -> Any:
+        recorded_client_args["database"] = database
+        return firestore_client
+
     monkeypatch.setattr(
         processor,
         "firestore",
-        SimpleNamespace(Client=lambda: firestore_client),
+        SimpleNamespace(Client=fake_firestore_client),
     )
     monkeypatch.setattr(
         processor,
@@ -177,3 +183,4 @@ def test_main_invokes_run_job(monkeypatch: pytest.MonkeyPatch) -> None:
     assert recorded["event_type"] == "taskcreated"
     assert recorded["firestore_client"] is firestore_client
     assert recorded["secret_manager_client"] is secret_client
+    assert recorded_client_args["database"] == processor.BUILDUM_FIRESTORE_DATABASE

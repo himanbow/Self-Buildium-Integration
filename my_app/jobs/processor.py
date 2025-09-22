@@ -9,7 +9,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
 
 from fastapi import HTTPException
 
-from ..services.account_context import BuildiumAccountContext, get_buildium_account_context
+from ..services.account_context import (
+    BUILDUM_FIRESTORE_DATABASE,
+    BuildiumAccountContext,
+    get_buildium_account_context,
+)
 from ..tasks import initiation as initiation_tasks
 from ..tasks.buildium_processor import BuildiumProcessingContext, BuildiumWebhookProcessor
 from ..tasks.initiation import handle_initiation_automation
@@ -293,7 +297,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if firestore is None or secretmanager is None:  # pragma: no cover - dependency guard
         parser.error("google-cloud-firestore and google-cloud-secret-manager must be installed.")
 
-    firestore_client = firestore.Client()
+    firestore_client = firestore.Client(database=BUILDUM_FIRESTORE_DATABASE)
     secret_manager_client = secretmanager.SecretManagerServiceClient()
 
     if args.all_accounts:

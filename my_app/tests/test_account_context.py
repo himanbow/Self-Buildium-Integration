@@ -107,6 +107,44 @@ def test_get_buildium_account_context_uses_firestore_webhook_secret() -> None:
     }
 
 
+def test_get_buildium_account_context_selects_buildium_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = "acct-321"
+    firestore_client = _FakeFirestoreClient(
+        {
+            account_id: {
+                "api_secret_name": "projects/example/secrets/api/versions/default",
+                "webhook_secret": "firestore-hook",
+            }
+        }
+    )
+    secret_manager_client = _FakeSecretManagerClient(
+        {"projects/example/secrets/api/versions/default": b"api-secret"}
+    )
+
+    captured: Dict[str, str] = {}
+
+    def fake_create_firestore_client(*, database: str) -> Any:
+        captured["database"] = database
+        return firestore_client
+
+    monkeypatch.setattr(
+        account_context,
+        "_create_firestore_client",
+        fake_create_firestore_client,
+    )
+
+    context = account_context.get_buildium_account_context(
+        account_id,
+        secret_manager_client=secret_manager_client,
+    )
+
+    assert captured["database"] == account_context.BUILDUM_FIRESTORE_DATABASE
+    assert context.api_secret == "api-secret"
+    assert context.webhook_secret == "firestore-hook"
+
+
 def test_get_buildium_account_context_falls_back_to_secret_manager_for_webhook_secret() -> None:
     account_id = "acct-456"
     firestore_client = _FakeFirestoreClient(
