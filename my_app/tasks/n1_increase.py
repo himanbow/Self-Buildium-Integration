@@ -14,6 +14,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 from urllib import request as urllib_request
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
+
 logger = logging.getLogger(__name__)
 
 FIRESTORE_COLLECTION_PATH = "buildium_accounts"
@@ -870,7 +872,7 @@ def handle_n1_increase_automation(
     if firestore_client is None:
         from google.cloud import firestore  # type: ignore
 
-        firestore_client = firestore.Client()
+        firestore_client = firestore.Client(database=BUILDUM_FIRESTORE_DATABASE)
 
     event_type = _extract_event_type(webhook)
     task_block = _extract_task_block(webhook)

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Protocol, Sequence
 from urllib import request as urllib_request
 
+from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
+
 logger = logging.getLogger(__name__)
 
 FIRESTORE_COLLECTION_PATH = "buildium_accounts"
@@ -212,7 +214,7 @@ def handle_initiation_automation(
     if firestore_client is None:
         from google.cloud import firestore  # type: ignore
 
-        firestore_client = firestore.Client()
+        firestore_client = firestore.Client(database=BUILDUM_FIRESTORE_DATABASE)
 
     gl_accounts = list(buildium_api.list_gl_accounts())
     categories = list(buildium_api.list_task_categories())

@@ -30,6 +30,7 @@ class BuildiumAccountContext:
     webhook_secret: str
 
 
+BUILDUM_FIRESTORE_DATABASE = "buildium"
 _FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 _WEBHOOK_SECRET_METADATA_KEYS = (
     "webhook_secret",
@@ -252,6 +253,12 @@ def _access_secret(
     return payload
 
 
+def _create_firestore_client(*, database: str) -> "firestore.Client":
+    from google.cloud import firestore
+
+    return firestore.Client(database=database)
+
+
 def get_buildium_account_context(
     account_id: str,
     *,
@@ -274,7 +281,7 @@ def get_buildium_account_context(
         )
 
     if firestore_client is None:
-        firestore_client = firestore.Client()
+        firestore_client = _create_firestore_client(database=BUILDUM_FIRESTORE_DATABASE)
     if secret_manager_client is None:
         secret_manager_client = secretmanager.SecretManagerServiceClient()
 
@@ -411,4 +418,8 @@ def get_buildium_account_context(
     )
 
 
-__all__ = ["BuildiumAccountContext", "get_buildium_account_context"]
+__all__ = [
+    "BuildiumAccountContext",
+    "BUILDUM_FIRESTORE_DATABASE",
+    "get_buildium_account_context",
+]
