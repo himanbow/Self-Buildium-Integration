@@ -577,67 +577,67 @@ def _render_pdf_summary(schedules: Sequence[Mapping[str, Any]]) -> bytes:
     return output.getvalue()
 
 
-def _render_notice(schedule: Mapping[str, Any]) -> bytes:
-    lines = [
-        "Ontario N1 Rent Increase Notice",
-        "Property: {property_name}",
-        "Unit: {unit_name}",
-        "Lease ID: {lease_id}",
-        "New Monthly Rent: ${new_rent}",
-        "Effective Date: {effective_date}",
-    ]
-    text = _escape_pdf_text("\n".join(line.format(**schedule) for line in lines))
-    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("utf-8")
+def _render_notice(
+    schedule: Mapping[str, Any], payload_entry: Optional[Mapping[str, Any]] = None
+) -> bytes:
+    from . import n1_notice_pdf
 
-    objects: List[bytes] = []
-    objects.append(b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n")
-    objects.append(b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n")
-    objects.append(
-        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
-    )
-    objects.append(
-        b"4 0 obj<</Length "
-        + str(len(stream)).encode("ascii")
-        + b">>stream\n"
-        + stream
-        + b"\nendstream\nendobj\n"
-    )
-    objects.append(b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n")
+    lease_info: Optional[Mapping[str, Any]] = None
+    if isinstance(payload_entry, Mapping):
+        lease_candidate = payload_entry.get("lease")
+        if isinstance(lease_candidate, Mapping):
+            lease_info = lease_candidate
+    return n1_notice_pdf.create_n1_notice_pdf(schedule=schedule, lease=lease_info)
 
-    output = BytesIO()
-    output.write(b"%PDF-1.4\n")
-    offsets = [0]
-    current = output.tell()
-    for obj in objects:
-        offsets.append(current)
-        output.write(obj)
-        current += len(obj)
 
-    xref_position = current
-    output.write(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
-    output.write(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        output.write(f"{offset:010d} 00000 n \n".encode("ascii"))
-    output.write(
-        (
-            "trailer<</Size {size}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF".format(
-                size=len(objects) + 1, xref=xref_position
-            )
-        ).encode("ascii")
-    )
-    return output.getvalue()
+def _decode_payload_entries(
+    chunks: Sequence[Mapping[str, Any]]
+) -> List[Mapping[str, Any]]:
+    from . import n1_data
+
+    entries: List[Mapping[str, Any]] = []
+    for chunk in chunks:
+        for entry in n1_data.decode_payload_chunk(chunk):
+            if isinstance(entry, Mapping):
+                entries.append(entry)
+    return entries
 
 
 def _combine_payload_chunks(chunks: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
-    from . import n1_data
-
     combined: List[Mapping[str, Any]] = []
-    for chunk in chunks:
-        for entry in n1_data.decode_payload_chunk(chunk):
-            schedule = entry.get("schedule") if isinstance(entry, Mapping) else None
-            if isinstance(schedule, Mapping):
-                combined.append(schedule)
+    for entry in _decode_payload_entries(chunks):
+        schedule = entry.get("schedule") if isinstance(entry, Mapping) else None
+        if isinstance(schedule, Mapping):
+            combined.append(schedule)
     return combined
+
+
+def _map_entries_by_lease(
+    entries: Sequence[Mapping[str, Any]]
+) -> Dict[str, Mapping[str, Any]]:
+    mapping: Dict[str, Mapping[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        lease_id: Optional[str] = None
+        schedule = entry.get("schedule")
+        if isinstance(schedule, Mapping):
+            lease_identifier = schedule.get("lease_id") or schedule.get("leaseId")
+            if lease_identifier is not None:
+                lease_id = str(lease_identifier)
+        if lease_id is None:
+            lease_block = entry.get("lease")
+            if isinstance(lease_block, Mapping):
+                lease_identifier = (
+                    lease_block.get("id")
+                    or lease_block.get("lease_id")
+                    or lease_block.get("leaseId")
+                )
+                if lease_identifier is not None:
+                    lease_id = str(lease_identifier)
+        if lease_id:
+            mapping[lease_id] = entry
+    return mapping
 
 
 def _build_serving_description(property_name: str, schedules: Sequence[Mapping[str, Any]]) -> str:
@@ -778,8 +778,17 @@ def _handle_task_completed(
 
     n1_block = data.get("n1_increase") or {}
     schedules: List[Mapping[str, Any]] = list(n1_block.get("schedules") or [])
-    if not schedules and n1_block.get("payload_chunks"):
-        schedules = _combine_payload_chunks(n1_block.get("payload_chunks"))
+    payload_chunks = list(n1_block.get("payload_chunks") or [])
+    payload_entries = _decode_payload_entries(payload_chunks)
+    if not schedules and payload_entries:
+        schedules = [
+            entry_schedule
+            for entry_schedule in (
+                entry.get("schedule") if isinstance(entry, Mapping) else None
+                for entry in payload_entries
+            )
+            if isinstance(entry_schedule, Mapping)
+        ]
     if not schedules:
         logger.warning(
             "No prepared schedules available for N1 completion.",
@@ -790,6 +799,7 @@ def _handle_task_completed(
     api = buildium_api or RequestsBuildiumAPI(api_headers=api_headers)
 
     property_groups: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    entry_map = _map_entries_by_lease(payload_entries)
     for schedule in schedules:
         lease_id = str(schedule.get("lease_id"))
         property_id = str(schedule.get("property_id"))
@@ -805,7 +815,7 @@ def _handle_task_completed(
                 end_date=schedule.get("extension_end_date"),
             )
 
-        notice_bytes = _render_notice(schedule)
+        notice_bytes = _render_notice(schedule, entry_map.get(lease_id))
         api.upload_document(
             lease_id=lease_id,
             property_id=property_id,

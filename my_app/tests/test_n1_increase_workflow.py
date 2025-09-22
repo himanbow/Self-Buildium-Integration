@@ -9,6 +9,8 @@ from zipfile import ZipFile
 
 import importlib
 
+from PyPDF2 import PdfReader
+
 n1_increase = importlib.import_module("my_app.tasks.n1_increase")
 n1_data_module = importlib.import_module("my_app.tasks.n1_data")
 
@@ -195,6 +197,39 @@ def _decode_pdf(pdf_b64: str) -> bytes:
     return base64.b64decode(pdf_b64)
 
 
+def _load_pdf_reader(pdf_bytes: bytes) -> PdfReader:
+    reader = PdfReader(BytesIO(pdf_bytes))
+    if reader.is_encrypted:
+        reader.decrypt("")
+    return reader
+
+
+def _collect_pdf_stream_text(reader: PdfReader) -> str:
+    segments: List[str] = []
+    for page in reader.pages:
+        contents = page.get_contents()
+        if contents is None:
+            continue
+        items = contents if isinstance(contents, list) else [contents]
+        for item in items:
+            try:
+                segments.append(item.get_data().decode("latin1"))
+            except Exception:  # pragma: no cover - defensive
+                continue
+    return "\n".join(segments)
+
+
+def _pdf_stream_pattern(value: str) -> str:
+    replacements = {
+        " ": "\\040",
+        "-": "\\055",
+        "$": "\\044",
+        ".": "\\056",
+        "%": "\\045",
+    }
+    return "".join(replacements.get(ch, ch) for ch in value)
+
+
 def test_handle_n1_creation_persists_schedules(monkeypatch) -> None:
     api = FakeBuildiumAPI()
     firestore = FakeFirestore(initial_docs={"acct-1": {"automated_tasks_category_id": "cat-1"}})
@@ -313,8 +348,35 @@ def test_handle_n1_completion_generates_documents(monkeypatch) -> None:
     assert api.extended_leases[0]["lease_id"] == "lease-2"
 
     assert len(api.uploaded_documents) == 2
+
+    expected_strings = {
+        "lease-1": [
+            "Residents of Unit 101",
+            "Property One",
+            "101 - Property One",
+            "$1236.00",
+            "$36.00",
+            "3.00%",
+            "2024-09-01",
+        ],
+        "lease-2": [
+            "Residents of Unit 201",
+            "Property Two",
+            "201 - Property Two",
+            "$1537.50",
+            "$37.50",
+            "2.50%",
+            "2024-09-01",
+        ],
+    }
+
     for upload in api.uploaded_documents:
-        assert upload["content"].startswith(b"%PDF")
+        lease_id = upload["lease_id"]
+        reader = _load_pdf_reader(upload["content"])
+        assert len(reader.pages) == 2
+        stream_text = _collect_pdf_stream_text(reader)
+        for expected_value in expected_strings[lease_id]:
+            assert _pdf_stream_pattern(expected_value) in stream_text
 
     tasks_by_property = defaultdict(list)
     for task in api.created_tasks:
