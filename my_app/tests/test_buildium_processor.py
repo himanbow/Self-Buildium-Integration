@@ -236,6 +236,54 @@ def test_enqueue_buildium_webhook_uses_default_project_id(monkeypatch) -> None:
     assert client.requests, "Cloud Tasks request was not issued."
 
 
+def test_enqueue_buildium_webhook_supports_legacy_env_vars(monkeypatch) -> None:
+    verified_webhook = _make_verified_webhook()
+
+    class _DummyClient:
+        def __init__(self) -> None:
+            self.queue_path_args = None
+            self.requests = []
+
+        def queue_path(self, project: str, location: str, queue: str) -> str:
+            self.queue_path_args = (project, location, queue)
+            return f"projects/{project}/locations/{location}/queues/{queue}"
+
+        def create_task(self, request: Mapping[str, Any]) -> Mapping[str, str]:
+            self.requests.append(request)
+            return {"name": "tasks/example"}
+
+    client = _DummyClient()
+
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "legacy-project")
+    monkeypatch.delenv("CLOUD_TASKS_QUEUE", raising=False)
+    monkeypatch.delenv("CLOUD_TASKS_LOCATION", raising=False)
+    monkeypatch.delenv("TASK_HANDLER_URL", raising=False)
+    monkeypatch.setenv("BUILDUM_TASKS_QUEUE", "legacy-queue")
+    monkeypatch.setenv("BUILDUM_TASKS_LOCATION", "northamerica-northeast1")
+    monkeypatch.setenv(
+        "BUILDUM_TASKS_SERVICE_URL",
+        "https://legacy.example.com/tasks/buildium-webhook",
+    )
+
+    response = buildium_processor.enqueue_buildium_webhook(verified_webhook, client=client)
+
+    assert response["name"] == "tasks/example"
+    assert client.queue_path_args == (
+        "legacy-project",
+        "northamerica-northeast1",
+        "legacy-queue",
+    )
+    assert client.requests, "Cloud Tasks request was not issued."
+
+    request = client.requests[0]
+    assert (
+        request["parent"]
+        == "projects/legacy-project/locations/northamerica-northeast1/queues/legacy-queue"
+    )
+    http_request = request["task"]["http_request"]
+    assert http_request["url"] == "https://legacy.example.com/tasks/buildium-webhook"
+
+
 def test_enqueue_buildium_webhook_uses_cloud_run_region(monkeypatch) -> None:
     verified_webhook = _make_verified_webhook()
 
