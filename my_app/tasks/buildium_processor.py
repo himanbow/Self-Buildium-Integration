@@ -15,8 +15,13 @@ from google.api_core import exceptions as google_exceptions
 from google.cloud import tasks_v2
 
 from ..config import DEFAULT_GCP_PROJECT_ID
+from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
 from ..webhooks.verification import VerifiedBuildiumWebhook
-from .initiation import handle_initiation_automation
+from .initiation import (
+    FIRESTORE_COLLECTION_PATH as INITIATION_COLLECTION_PATH,
+    INITIATION_COMPLETED_FIELD,
+    handle_initiation_automation,
+)
 from .n1_increase import handle_n1_increase_automation
 
 logger = logging.getLogger(__name__)
@@ -267,8 +272,9 @@ class AutomationHandler(Protocol):
 
 
 _AUTOMATED_TASKS_KEY = "automatedtasks"
+_INITIATION_AUTOMATION_KEY = ("taskcreated", "ontarioautomationsinitiation")
 _AUTOMATION_ROUTING_TABLE: Dict[Tuple[str, str], AutomationHandler] = {
-    ("taskcreated", "Ontario Automations Initiation"): handle_initiation_automation,
+    _INITIATION_AUTOMATION_KEY: handle_initiation_automation,
     ("taskcreated", "n1increase"): handle_n1_increase_automation,
     ("taskstatuschanged", "n1increase"): handle_n1_increase_automation,
 }
@@ -349,6 +355,56 @@ def _select_automation_handler(
     if not event_key or not task_key:
         return None
     return _AUTOMATION_ROUTING_TABLE.get((event_key, task_key))
+
+
+def _requires_automated_category(
+    *, event_key: Optional[str], task_key: Optional[str]
+) -> bool:
+    """Determine whether the automation requires the automated task category."""
+
+    if (event_key, task_key) == _INITIATION_AUTOMATION_KEY:
+        return False
+    return True
+
+
+def _has_completed_initiation(*, account_id: str) -> bool:
+    """Check Firestore for a flag that the initiation automation has executed."""
+
+    try:
+        from google.cloud import firestore  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency safeguard
+        logger.debug(
+            "Firestore client not available when checking initiation status.",
+            extra={"account_id": account_id},
+        )
+        return False
+
+    try:
+        client = firestore.Client(database=BUILDUM_FIRESTORE_DATABASE)
+        collection = client.collection(INITIATION_COLLECTION_PATH)
+        document = collection.document(account_id)
+        snapshot = document.get()
+    except Exception:
+        logger.warning(
+            "Unable to determine Buildium initiation status from Firestore.",
+            extra={"account_id": account_id},
+        )
+        return False
+
+    if not getattr(snapshot, "exists", False):
+        return False
+
+    try:
+        payload = snapshot.to_dict() or {}
+    except Exception:
+        logger.warning(
+            "Unable to decode Buildium initiation Firestore document; assuming not completed.",
+            extra={"account_id": account_id},
+        )
+        return False
+
+    status = payload.get(INITIATION_COMPLETED_FIELD)
+    return bool(status)
 
 
 @dataclass
@@ -463,19 +519,10 @@ class BuildiumWebhookProcessor:
             )
             return
 
-        task_category_name = _extract_task_category_name(task_data)
-        if _normalize_identifier(task_category_name) != _AUTOMATED_TASKS_KEY:
-            logger.debug(
-                "Ignoring non-automated Buildium task payload.",
-                extra={
-                    **self.metadata,
-                    "task_category_name": task_category_name,
-                },
-            )
-            return
-
         event_type = _extract_event_type(webhook_payload)
         task_name = _extract_task_name(task_data)
+        event_key = _normalize_identifier(event_type)
+        task_key = _normalize_identifier(task_name)
         handler = _select_automation_handler(event_type=event_type, task_name=task_name)
         if handler is None:
             logger.info(
@@ -484,6 +531,20 @@ class BuildiumWebhookProcessor:
                     **self.metadata,
                     "event_type": event_type,
                     "task_name": task_name,
+                },
+            )
+            return
+
+        task_category_name = _extract_task_category_name(task_data)
+        category_key = _normalize_identifier(task_category_name)
+        if _requires_automated_category(event_key=event_key, task_key=task_key) and (
+            category_key != _AUTOMATED_TASKS_KEY
+        ):
+            logger.debug(
+                "Ignoring non-automated Buildium task payload.",
+                extra={
+                    **self.metadata,
+                    "task_category_name": task_category_name,
                 },
             )
             return
@@ -497,6 +558,15 @@ class BuildiumWebhookProcessor:
 
         raw_gl_mapping = payload.get("gl_mapping")
         gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
+
+        if (event_key, task_key) == _INITIATION_AUTOMATION_KEY and _has_completed_initiation(
+            account_id=account_id
+        ):
+            logger.info(
+                "Skipping Buildium initiation automation; workflow already completed.",
+                extra={**self.metadata, "account_id": account_id},
+            )
+            return
 
         logger.info(
             "Dispatching Buildium automation task to handler.",

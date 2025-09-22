@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 AUTOMATED_TASK_CATEGORY_NAME = "Automated Tasks"
+INITIATION_COMPLETED_FIELD = "initiation_automation_completed"
 
 
 class BuildiumInitiationAPI(Protocol):
@@ -320,6 +321,7 @@ def handle_initiation_automation(
         "gl_mapping": dict(gl_mapping),
         "company": company,
         "document_templates": templates,
+        INITIATION_COMPLETED_FIELD: True,
     }
     if automated_category_id:
         updates["automated_tasks_category_id"] = automated_category_id
@@ -352,6 +354,11 @@ def handle_initiation_automation(
         extra={"account_id": account_id, "category_id": automated_category_id},
     )
 
-
-__all__ = ["handle_initiation_automation", "RequestsBuildiumAPI", "BuildiumInitiationAPI"]
+__all__ = [
+    "handle_initiation_automation",
+    "RequestsBuildiumAPI",
+    "BuildiumInitiationAPI",
+    "FIRESTORE_COLLECTION_PATH",
+    "INITIATION_COMPLETED_FIELD",
+]
 
