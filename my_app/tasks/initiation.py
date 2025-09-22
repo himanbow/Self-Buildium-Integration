@@ -160,16 +160,75 @@ def _merge_dict(target: MutableMapping[str, Any], updates: Mapping[str, Any]) ->
             target[key] = value
 
 
-def _build_onboarding_description(*, company: Mapping[str, Any], gl_accounts: Sequence[Mapping[str, Any]]) -> str:
+def _select_first_value(
+    data: Mapping[str, Any],
+    *,
+    candidates: Sequence[str],
+) -> Optional[Any]:
+    lowered = {key.lower() for key in candidates}
+    for key, value in data.items():
+        if str(key).lower() in lowered and value is not None:
+            return value
+    return None
+
+
+def _normalize_gl_accounts(
+    accounts: Sequence[Mapping[str, Any]]
+) -> Sequence[Mapping[str, str]]:
+    normalized: list[Dict[str, str]] = []
+    for account in accounts:
+        if not isinstance(account, Mapping):
+            continue
+        normalized_account: Dict[str, str] = {}
+        identifier = _select_first_value(
+            account,
+            candidates=(
+                "id",
+                "glAccountId",
+                "accountId",
+            ),
+        )
+        if identifier is not None:
+            normalized_account["id"] = str(identifier)
+
+        name = _select_first_value(
+            account,
+            candidates=(
+                "name",
+                "glAccountName",
+                "accountName",
+                "description",
+            ),
+        )
+        if name is not None:
+            normalized_account["name"] = str(name)
+
+        if normalized_account:
+            if "id" not in normalized_account:
+                # Firestore documents require stable key values, but
+                # maintaining entries with a name-only payload still offers
+                # value for operators during onboarding.
+                normalized_account.setdefault("id", "")
+            normalized.append(normalized_account)
+    return normalized
+
+
+def _build_onboarding_description(
+    *, company: Mapping[str, Any], gl_accounts: Sequence[Mapping[str, Any]]
+) -> str:
     company_name = company.get("name") or company.get("legalName") or "your organization"
     account_lines = []
     for account in gl_accounts[:5]:
         if not isinstance(account, Mapping):
             continue
-        code = str(account.get("code") or account.get("number") or "")
-        name = str(account.get("name") or account.get("description") or "")
-        if code or name:
-            account_lines.append(f"- {code} {name}".strip())
+        name = str(account.get("name") or "").strip()
+        identifier = str(account.get("id") or "").strip()
+        if name and identifier:
+            account_lines.append(f"- {name} (ID: {identifier})")
+        elif name:
+            account_lines.append(f"- {name}")
+        elif identifier:
+            account_lines.append(f"- ID: {identifier}")
     sample_accounts = "\n".join(account_lines)
     description = [
         "Welcome to the Naborly automated Buildium workflows!",
@@ -217,6 +276,7 @@ def handle_initiation_automation(
         firestore_client = firestore.Client(database=BUILDUM_FIRESTORE_DATABASE)
 
     gl_accounts = list(buildium_api.list_gl_accounts())
+    normalized_gl_accounts = list(_normalize_gl_accounts(gl_accounts))
     categories = list(buildium_api.list_task_categories())
     company = dict(buildium_api.get_company_profile())
     templates = list(buildium_api.list_document_templates())
@@ -227,7 +287,7 @@ def handle_initiation_automation(
         "Fetched Buildium metadata for initiation workflow.",
         extra={
             "account_id": account_id,
-            "gl_account_count": len(gl_accounts),
+            "gl_account_count": len(normalized_gl_accounts),
             "template_count": len(templates),
             "automated_category_id": automated_category_id,
         },
@@ -256,7 +316,7 @@ def handle_initiation_automation(
 
     updates: Dict[str, Any] = {
         "last_initiation_run": _timestamp(),
-        "gl_accounts": gl_accounts,
+        "gl_accounts": normalized_gl_accounts,
         "gl_mapping": dict(gl_mapping),
         "company": company,
         "document_templates": templates,
@@ -273,12 +333,14 @@ def handle_initiation_automation(
         "Persisted Buildium initiation metadata to Firestore.",
         extra={
             "account_id": account_id,
-            "gl_accounts": len(gl_accounts),
+            "gl_accounts": len(normalized_gl_accounts),
             "templates": len(templates),
         },
     )
 
-    description = _build_onboarding_description(company=company, gl_accounts=gl_accounts)
+    description = _build_onboarding_description(
+        company=company, gl_accounts=normalized_gl_accounts
+    )
     buildium_api.create_task(
         category_id=automated_category_id,
         name="Automation Onboarding Checklist",
