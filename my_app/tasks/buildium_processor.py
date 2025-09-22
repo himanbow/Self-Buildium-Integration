@@ -28,6 +28,11 @@ _DEFAULT_TASK_HANDLER_URL = "http://localhost:8080/tasks/buildium-webhook"
 CLOUD_TASKS_QUEUE_ENV = "CLOUD_TASKS_QUEUE"
 CLOUD_TASKS_LOCATION_ENV = "CLOUD_TASKS_LOCATION"
 TASK_HANDLER_URL_ENV = "TASK_HANDLER_URL"
+
+# Legacy/alternate environment variable names that have been used in deployments.
+LEGACY_CLOUD_TASKS_QUEUE_ENV = "BUILDUM_TASKS_QUEUE"
+LEGACY_CLOUD_TASKS_LOCATION_ENV = "BUILDUM_TASKS_LOCATION"
+LEGACY_TASK_HANDLER_URL_ENV = "BUILDUM_TASKS_SERVICE_URL"
 CLOUD_RUN_REGION_ENV = "CLOUD_RUN_REGION"
 
 _PROJECT_ID_ENV_CANDIDATES: Tuple[str, ...] = (
@@ -40,13 +45,33 @@ _PROJECT_ID_ENV_CANDIDATES: Tuple[str, ...] = (
 
 
 def _get_cloud_tasks_queue() -> str:
-    return os.getenv(CLOUD_TASKS_QUEUE_ENV, _DEFAULT_CLOUD_TASKS_QUEUE)
+    queue = os.getenv(CLOUD_TASKS_QUEUE_ENV)
+    if queue:
+        return queue
+
+    legacy_queue = os.getenv(LEGACY_CLOUD_TASKS_QUEUE_ENV)
+    if legacy_queue:
+        logger.info(
+            "Using legacy Cloud Tasks queue env var.",
+            extra={"env": LEGACY_CLOUD_TASKS_QUEUE_ENV},
+        )
+        return legacy_queue
+
+    return _DEFAULT_CLOUD_TASKS_QUEUE
 
 
 def _get_cloud_tasks_location() -> str:
     location = os.getenv(CLOUD_TASKS_LOCATION_ENV)
     if location:
         return location
+
+    legacy_location = os.getenv(LEGACY_CLOUD_TASKS_LOCATION_ENV)
+    if legacy_location:
+        logger.info(
+            "Using legacy Cloud Tasks location env var.",
+            extra={"env": LEGACY_CLOUD_TASKS_LOCATION_ENV},
+        )
+        return legacy_location
 
     cloud_run_region = os.getenv(CLOUD_RUN_REGION_ENV)
     if cloud_run_region:
@@ -56,7 +81,19 @@ def _get_cloud_tasks_location() -> str:
 
 
 def _get_task_handler_url() -> str:
-    return os.getenv(TASK_HANDLER_URL_ENV, _DEFAULT_TASK_HANDLER_URL)
+    handler_url = os.getenv(TASK_HANDLER_URL_ENV)
+    if handler_url:
+        return handler_url
+
+    legacy_handler_url = os.getenv(LEGACY_TASK_HANDLER_URL_ENV)
+    if legacy_handler_url:
+        logger.info(
+            "Using legacy task handler URL env var.",
+            extra={"env": LEGACY_TASK_HANDLER_URL_ENV},
+        )
+        return legacy_handler_url
+
+    return _DEFAULT_TASK_HANDLER_URL
 
 
 class BuildiumProcessorError(RuntimeError):
