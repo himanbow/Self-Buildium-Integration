@@ -28,6 +28,7 @@ _DEFAULT_TASK_HANDLER_URL = "http://localhost:8080/tasks/buildium-webhook"
 CLOUD_TASKS_QUEUE_ENV = "CLOUD_TASKS_QUEUE"
 CLOUD_TASKS_LOCATION_ENV = "CLOUD_TASKS_LOCATION"
 TASK_HANDLER_URL_ENV = "TASK_HANDLER_URL"
+CLOUD_RUN_REGION_ENV = "CLOUD_RUN_REGION"
 
 _PROJECT_ID_ENV_CANDIDATES: Tuple[str, ...] = (
     "GOOGLE_CLOUD_PROJECT",
@@ -43,7 +44,15 @@ def _get_cloud_tasks_queue() -> str:
 
 
 def _get_cloud_tasks_location() -> str:
-    return os.getenv(CLOUD_TASKS_LOCATION_ENV, _DEFAULT_CLOUD_TASKS_LOCATION)
+    location = os.getenv(CLOUD_TASKS_LOCATION_ENV)
+    if location:
+        return location
+
+    cloud_run_region = os.getenv(CLOUD_RUN_REGION_ENV)
+    if cloud_run_region:
+        return cloud_run_region
+
+    return _DEFAULT_CLOUD_TASKS_LOCATION
 
 
 def _get_task_handler_url() -> str:
@@ -534,19 +543,26 @@ def enqueue_buildium_webhook(
 
     try:
         response = client.create_task(request=request)
+    except google_exceptions.NotFound as exc:
+        message = (
+            "Cloud Tasks queue does not exist. Create the queue or configure "
+            "CLOUD_TASKS_QUEUE/CLOUD_TASKS_LOCATION to match an existing queue."
+        )
+        logger.exception(message, extra={**metadata, "queue_path": parent})
+        raise BuildiumProcessorError(message) from exc
     except google_exceptions.GoogleAPICallError as exc:
         message = "Failed to enqueue Buildium webhook task via Cloud Tasks."
-        logger.exception(message, extra=metadata)
+        logger.exception(message, extra={**metadata, "queue_path": parent})
         raise BuildiumProcessorError(message) from exc
     except Exception as exc:  # pragma: no cover - defensive guard
         message = "Unexpected error while enqueuing Buildium webhook task."
-        logger.exception(message, extra=metadata)
+        logger.exception(message, extra={**metadata, "queue_path": parent})
         raise BuildiumProcessorError(message) from exc
 
     task_name = getattr(response, "name", None)
     logger.info(
         "Enqueued Buildium webhook task in Cloud Tasks.",
-        extra={**metadata, "task_name": task_name},
+        extra={**metadata, "task_name": task_name, "queue_path": parent},
     )
 
     return response
