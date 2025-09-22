@@ -45,6 +45,10 @@ _PROJECT_ID_ENV_CANDIDATES: Tuple[str, ...] = (
 
 
 def _get_cloud_tasks_queue() -> str:
+    """Resolve the Cloud Tasks queue name from environment configuration.
+
+    Honors legacy variable names before falling back to the module default.
+    """
     queue = os.getenv(CLOUD_TASKS_QUEUE_ENV)
     if queue:
         return queue
@@ -61,6 +65,11 @@ def _get_cloud_tasks_queue() -> str:
 
 
 def _get_cloud_tasks_location() -> str:
+    """Resolve the Cloud Tasks location from environment configuration.
+
+    Checks modern and legacy variables as well as the Cloud Run region before
+    defaulting to the module constant.
+    """
     location = os.getenv(CLOUD_TASKS_LOCATION_ENV)
     if location:
         return location
@@ -81,6 +90,11 @@ def _get_cloud_tasks_location() -> str:
 
 
 def _get_task_handler_url() -> str:
+    """Resolve the Buildium task handler URL from environment configuration.
+
+    Supports historic variable names and defaults to the local development
+    endpoint.
+    """
     handler_url = os.getenv(TASK_HANDLER_URL_ENV)
     if handler_url:
         return handler_url
@@ -143,6 +157,11 @@ def _extract_from_candidates(
 
 
 def _prepare_buildium_headers(verified_webhook: VerifiedBuildiumWebhook) -> Dict[str, str]:
+    """Build Buildium API headers from the stored account context.
+
+    Parses the secret payload to prefer bearer tokens, with fallbacks for
+    API keys or basic authentication credentials when necessary.
+    """
     headers: Dict[str, str] = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -344,6 +363,11 @@ def _extract_task_category_name(task_data: Mapping[str, Any]) -> Optional[str]:
 def _select_automation_handler(
     *, event_type: Optional[str], task_name: Optional[str]
 ) -> Optional[AutomationHandler]:
+    """Select the automation handler for a Buildium event/task pair.
+
+    Normalizes identifiers to smooth out whitespace and punctuation
+    differences.
+    """
     event_key = _normalize_identifier(event_type)
     task_key = _normalize_identifier(task_name)
     if not event_key or not task_key:
@@ -439,6 +463,12 @@ class BuildiumWebhookProcessor:
         return payload
 
     def _perform_work(self, payload: Mapping[str, Any]) -> None:
+        """Filter for automation tasks and dispatch them to the registered handler.
+
+        Ensures the payload is marked as automated before routing to a matched
+        handler. Passes the prepared account headers and GL mapping to the
+        handler.
+        """
         logger.info(
             "Dispatched Buildium webhook payload for downstream processing.",
             extra={
@@ -522,7 +552,12 @@ def enqueue_buildium_webhook(
     *,
     client: Optional[tasks_v2.CloudTasksClient] = None,
 ) -> Any:
-    """Serialize the verified webhook and enqueue processing via Cloud Tasks."""
+    """Enqueue the verified webhook for processing via Cloud Tasks.
+
+    Reads the environment-driven queue, location, and handler URL before posting
+    the serialized webhook to Cloud Tasks. Raises a ``BuildiumProcessorError``
+    when required settings are missing.
+    """
 
     queue_name = _get_cloud_tasks_queue().strip()
     location = _get_cloud_tasks_location().strip()
