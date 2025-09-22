@@ -149,6 +149,64 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
     assert n1_call.kwargs["webhook"] == n1_webhook
 
 
+def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
+    processor = _make_processor({})
+
+    initiation_webhook = {
+        "eventType": "TaskCreated",
+        "task": {
+            "taskName": "Ontario Automations Initiation",
+            "taskCategoryName": "General",
+        },
+    }
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {buildium_processor._INITIATION_AUTOMATION_KEY: mock_handler},
+    )
+    monkeypatch.setattr(
+        buildium_processor,
+        "_has_completed_initiation",
+        lambda account_id: False,
+    )
+
+    processor._perform_work(_base_payload(initiation_webhook))
+
+    mock_handler.assert_called_once()
+
+
+def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
+    processor = _make_processor({})
+
+    initiation_webhook = {
+        "eventType": "TaskCreated",
+        "task": {
+            "taskName": "Ontario Automations Initiation",
+            "taskCategoryName": "General",
+        },
+    }
+
+    mock_handler = Mock()
+
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {buildium_processor._INITIATION_AUTOMATION_KEY: mock_handler},
+    )
+
+    def _completed(account_id: str) -> bool:
+        assert account_id == "acct-123"
+        return True
+
+    monkeypatch.setattr(buildium_processor, "_has_completed_initiation", _completed)
+
+    processor._perform_work(_base_payload(initiation_webhook))
+
+    mock_handler.assert_not_called()
+
+
 def test_enqueue_buildium_webhook_creates_cloud_task(monkeypatch) -> None:
     verified_webhook = _make_verified_webhook()
 
