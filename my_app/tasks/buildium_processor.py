@@ -268,7 +268,7 @@ class AutomationHandler(Protocol):
 
 _AUTOMATED_TASKS_KEY = "automatedtasks"
 _AUTOMATION_ROUTING_TABLE: Dict[Tuple[str, str], AutomationHandler] = {
-    ("taskcreated", "initiation"): handle_initiation_automation,
+    ("taskcreated", "Ontario Automations Initiation"): handle_initiation_automation,
     ("taskcreated", "n1increase"): handle_n1_increase_automation,
     ("taskstatuschanged", "n1increase"): handle_n1_increase_automation,
 }
