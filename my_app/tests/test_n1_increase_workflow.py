@@ -10,6 +10,7 @@ from zipfile import ZipFile
 import importlib
 
 n1_increase = importlib.import_module("my_app.tasks.n1_increase")
+n1_data_module = importlib.import_module("my_app.tasks.n1_data")
 
 
 class FakeDocument:
@@ -85,6 +86,28 @@ class FakeBuildiumAPI:
             ("prop-1", "unit-1"): {"marketRent": "1400"},
             ("prop-2", "unit-2"): {"marketRent": "1650"},
         }
+        self.lease_notes: Dict[str, List[Mapping[str, Any]]] = {
+            "lease-1": [],
+            "lease-2": [],
+        }
+        self.building_notes: Dict[str, List[Mapping[str, Any]]] = {
+            "prop-1": [],
+            "prop-2": [],
+        }
+        self.recurring_transactions: Dict[str, List[Mapping[str, Any]]] = {
+            "lease-1": [
+                {"amount": "1200", "glAccountNumber": "4000", "description": "Rent"}
+            ],
+            "lease-2": [
+                {"amount": "1500", "glAccountNumber": "4000", "description": "Rent"}
+            ],
+        }
+        self.agi_summaries: Dict[str, Mapping[str, Any]] = {
+            "lease-1": {},
+            "lease-2": {},
+        }
+        self.presigned_urls: Dict[str, Mapping[str, Any]] = {}
+        self.downloaded_files: Dict[str, bytes] = {}
         self.uploaded_documents: List[Mapping[str, Any]] = []
         self.updated_leases: List[Mapping[str, Any]] = []
         self.extended_leases: List[Mapping[str, Any]] = []
@@ -98,6 +121,24 @@ class FakeBuildiumAPI:
 
     def get_ontario_increase_rates(self) -> Mapping[str, Any]:
         return {"default": "0.025", "per_property": {"prop-1": "0.03"}}
+
+    def list_lease_notes(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        return list(self.lease_notes.get(lease_id, []))
+
+    def list_building_notes(self, property_id: str) -> Sequence[Mapping[str, Any]]:
+        return list(self.building_notes.get(property_id, []))
+
+    def list_recurring_transactions(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        return list(self.recurring_transactions.get(lease_id, []))
+
+    def get_above_guideline_increase(self, *, lease_id: str) -> Mapping[str, Any]:
+        return dict(self.agi_summaries.get(lease_id, {}))
+
+    def get_presigned_download(self, download_id: str) -> Mapping[str, Any]:
+        return dict(self.presigned_urls.get(download_id, {}))
+
+    def download_presigned_url(self, url: str) -> bytes:
+        return bytes(self.downloaded_files.get(url, b""))
 
     def upload_document(
         self,
@@ -178,6 +219,7 @@ def test_handle_n1_creation_persists_schedules(monkeypatch) -> None:
     assert len(n1_data["payload_chunks"]) >= 1
     assert n1_data["schedules"][0]["property_name"] == "Property One"
     assert n1_data["schedules"][1]["is_extended"] is True
+    assert n1_data["schedules"][0]["agi_amount"] == "0.00"
 
     excel_xml = _decode_excel(n1_data["summary_files"]["excel"])
     assert "Property One" in excel_xml
@@ -189,6 +231,16 @@ def test_handle_n1_creation_persists_schedules(monkeypatch) -> None:
     schedule_map = {item["lease_id"]: item for item in n1_data["schedules"]}
     assert schedule_map["lease-1"]["new_rent"] == "1236.00"
     assert schedule_map["lease-2"]["new_rent"] == "1537.50"
+    assert schedule_map["lease-2"]["agi_amount"] == "0.00"
+
+    first_chunk = n1_data["payload_chunks"][0]
+    assert "encryption" in first_chunk
+    assert first_chunk["encryption"]["algorithm"] == "xor+zlib"
+
+    decoded_entries = n1_data_module.decode_payload_chunk(first_chunk)
+    assert decoded_entries
+    assert decoded_entries[0]["schedule"]["lease_id"] == "lease-1"
+    assert decoded_entries[0]["recurring_transactions"][0]["amount"] == "1200.00"
 
 
 def test_handle_n1_completion_generates_documents(monkeypatch) -> None:

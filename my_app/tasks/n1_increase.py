@@ -34,6 +34,24 @@ class BuildiumN1API(Protocol):
     def get_ontario_increase_rates(self) -> Mapping[str, Any]:
         ...
 
+    def list_lease_notes(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def list_building_notes(self, property_id: str) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def list_recurring_transactions(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def get_above_guideline_increase(self, *, lease_id: str) -> Mapping[str, Any]:
+        ...
+
+    def get_presigned_download(self, download_id: str) -> Mapping[str, Any]:
+        ...
+
+    def download_presigned_url(self, url: str) -> bytes:
+        ...
+
     def upload_document(
         self,
         *,
@@ -134,6 +152,53 @@ class RequestsBuildiumAPI:
     def get_ontario_increase_rates(self) -> Mapping[str, Any]:
         response = self._get("rentcontrols/ontario")
         return response if isinstance(response, Mapping) else {}
+
+    def list_lease_notes(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        notes = self._get(f"leases/{lease_id}/notes")
+        if isinstance(notes, Sequence):
+            return [dict(item) if isinstance(item, Mapping) else item for item in notes]
+        if isinstance(notes, Mapping):
+            items = notes.get("items")
+            if isinstance(items, Iterable):
+                return [dict(item) if isinstance(item, Mapping) else item for item in items]
+            return [dict(notes)]
+        return []
+
+    def list_building_notes(self, property_id: str) -> Sequence[Mapping[str, Any]]:
+        notes = self._get(f"properties/{property_id}/notes")
+        if isinstance(notes, Sequence):
+            return [dict(item) if isinstance(item, Mapping) else item for item in notes]
+        if isinstance(notes, Mapping):
+            items = notes.get("items")
+            if isinstance(items, Iterable):
+                return [dict(item) if isinstance(item, Mapping) else item for item in items]
+            return [dict(notes)]
+        return []
+
+    def list_recurring_transactions(self, lease_id: str) -> Sequence[Mapping[str, Any]]:
+        transactions = self._get(f"leases/{lease_id}/recurringtransactions")
+        if isinstance(transactions, Sequence):
+            return [dict(item) if isinstance(item, Mapping) else item for item in transactions]
+        if isinstance(transactions, Mapping):
+            items = transactions.get("items")
+            if isinstance(items, Iterable):
+                return [dict(item) if isinstance(item, Mapping) else item for item in items]
+            return [dict(transactions)]
+        return []
+
+    def get_above_guideline_increase(self, *, lease_id: str) -> Mapping[str, Any]:
+        response = self._get(f"leases/{lease_id}/abovetheguidelineincrease")
+        return dict(response) if isinstance(response, Mapping) else {}
+
+    def get_presigned_download(self, download_id: str) -> Mapping[str, Any]:
+        response = self._get(f"documents/{download_id}/downloadurl")
+        return dict(response) if isinstance(response, Mapping) else {}
+
+    def download_presigned_url(self, url: str) -> bytes:
+        request = urllib_request.Request(url, headers=self._headers, method="GET")
+        with urllib_request.urlopen(request) as response:  # pragma: no cover - network
+            data = response.read()
+        return data or b""
 
     def upload_document(
         self,
@@ -563,110 +628,16 @@ def _render_notice(schedule: Mapping[str, Any]) -> bytes:
     return output.getvalue()
 
 
-def _chunk_payload(payload: Sequence[Mapping[str, Any]], *, max_bytes: int = MAX_PAYLOAD_BYTES) -> List[Mapping[str, Any]]:
-    chunks: List[Mapping[str, Any]] = []
-    current: List[Mapping[str, Any]] = []
-    for item in payload:
-        test_chunk = current + [item]
-        encoded = json.dumps(test_chunk, separators=(",", ":")).encode("utf-8")
-        if encoded and len(encoded) > max_bytes:
-            if not current:
-                # Item itself exceeds max size; force single-item chunk
-                encoded = json.dumps([item], separators=(",", ":")).encode("utf-8")
-                chunks.append(
-                    {
-                        "index": len(chunks),
-                        "payload": base64.b64encode(encoded).decode("ascii"),
-                        "count": 1,
-                    }
-                )
-                current = []
-                continue
-            chunks.append(
-                {
-                    "index": len(chunks),
-                    "payload": base64.b64encode(
-                        json.dumps(current, separators=(",", ":")).encode("utf-8")
-                    ).decode("ascii"),
-                    "count": len(current),
-                }
-            )
-            current = [item]
-        else:
-            current.append(item)
-    if current:
-        chunks.append(
-            {
-                "index": len(chunks),
-                "payload": base64.b64encode(
-                    json.dumps(current, separators=(",", ":")).encode("utf-8")
-                ).decode("ascii"),
-                "count": len(current),
-            }
-        )
-    return chunks
-
-
 def _combine_payload_chunks(chunks: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    from . import n1_data
+
     combined: List[Mapping[str, Any]] = []
     for chunk in chunks:
-        payload = chunk.get("payload")
-        if not isinstance(payload, str):
-            continue
-        try:
-            decoded = base64.b64decode(payload.encode("ascii"))
-            combined.extend(json.loads(decoded.decode("utf-8")))
-        except Exception:
-            logger.exception("Failed to decode payload chunk; skipping")
+        for entry in n1_data.decode_payload_chunk(chunk):
+            schedule = entry.get("schedule") if isinstance(entry, Mapping) else None
+            if isinstance(schedule, Mapping):
+                combined.append(schedule)
     return combined
-
-
-def _prepare_schedule(
-    lease: Mapping[str, Any],
-    *,
-    rates: Mapping[str, Any],
-    api: BuildiumN1API,
-) -> Mapping[str, Any]:
-    lease_id = _extract_identifier(lease, "leaseId", "id", "lease") or ""
-    property_block = lease.get("property") if isinstance(lease.get("property"), Mapping) else {}
-    property_id = _extract_identifier(lease, "propertyId") or _extract_identifier(property_block or {}, "id") or ""
-    unit_block = lease.get("unit") if isinstance(lease.get("unit"), Mapping) else {}
-    unit_id = _extract_identifier(lease, "unitId") or _extract_identifier(unit_block or {}, "id") or ""
-    property_name = ""
-    if isinstance(property_block, Mapping):
-        property_name = str(property_block.get("name") or property_block.get("displayName") or "")
-    if not property_name:
-        property_name = str(lease.get("propertyName") or "")
-    unit_name = ""
-    if isinstance(unit_block, Mapping):
-        unit_name = str(unit_block.get("name") or unit_block.get("number") or "")
-    if not unit_name:
-        unit_name = str(lease.get("unitName") or "")
-
-    current_rent = _extract_rent_amount(lease)
-    rate = _determine_increase_rate(str(property_id), rates)
-    increase_amount = _legal_round(current_rent * rate)
-    new_rent = _legal_round(current_rent + increase_amount)
-    market_rent_info = api.get_market_rent(property_id=str(property_id), unit_id=str(unit_id)) or {}
-    market_rent = _decimal(market_rent_info.get("marketRent") or market_rent_info.get("amount"))
-
-    schedule = {
-        "lease_id": str(lease_id),
-        "property_id": str(property_id),
-        "unit_id": str(unit_id),
-        "property_name": property_name,
-        "unit_name": unit_name,
-        "current_rent": _to_serializable_decimal(current_rent),
-        "new_rent": _to_serializable_decimal(new_rent),
-        "increase_rate": str(rate),
-        "increase_rate_percent": f"{(rate * Decimal('100')).quantize(Decimal('0.01'))}%",
-        "increase_amount": _to_serializable_decimal(increase_amount),
-        "market_rent": _to_serializable_decimal(market_rent),
-        "effective_date": _determine_effective_date(lease),
-        "is_extended": _detect_extended_lease(lease),
-        "extension_end_date": _determine_extension_end_date(lease),
-    }
-    return schedule
 
 
 def _build_serving_description(property_name: str, schedules: Sequence[Mapping[str, Any]]) -> str:
@@ -739,16 +710,20 @@ def _handle_task_created(
     firestore_client: Any,
     buildium_api: Optional[BuildiumN1API],
 ) -> None:
+    from . import n1_data
+
     api = buildium_api or RequestsBuildiumAPI(api_headers=api_headers)
 
-    leases = list(api.list_eligible_leases())
     rates = api.get_ontario_increase_rates() or {}
-    schedules = [
-        _prepare_schedule(lease, rates=rates, api=api)
-        for lease in leases
-    ]
+    prepared = n1_data.prepare_n1_data(
+        api,
+        rates=rates,
+        gl_mapping=gl_mapping,
+        max_payload_bytes=MAX_PAYLOAD_BYTES,
+    )
 
-    payload_chunks = _chunk_payload(schedules)
+    schedules = list(prepared.schedules)
+    payload_chunks = list(prepared.payload_chunks)
     excel_bytes = _render_excel_summary(schedules)
     pdf_bytes = _render_pdf_summary(schedules)
 
@@ -756,6 +731,10 @@ def _handle_task_created(
     existing = _load_document(document)
     merged_existing = dict(existing)
     merged_existing.setdefault("gl_mapping", dict(gl_mapping))
+    existing_n1_block = dict(merged_existing.get("n1_increase") or {})
+    if prepared.excluded:
+        existing_n1_block["excluded_leases"] = [dict(item) for item in prepared.excluded]
+    merged_existing["n1_increase"] = existing_n1_block
 
     _persist_schedules(
         document=document,
@@ -765,6 +744,15 @@ def _handle_task_created(
         excel_bytes=excel_bytes,
         pdf_bytes=pdf_bytes,
     )
+
+    if prepared.excluded:
+        logger.info(
+            "Excluded ineligible leases from N1 preparation.",
+            extra={
+                "account_id": account_id,
+                "excluded_count": len(prepared.excluded),
+            },
+        )
 
     logger.info(
         "Prepared N1 rent increase schedules.",
