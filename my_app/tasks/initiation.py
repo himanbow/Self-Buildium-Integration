@@ -137,6 +137,7 @@ def _timestamp() -> str:
 
 
 def _find_automated_category_id(categories: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """Identify the "Automated Tasks" category regardless of API field naming."""
     for category in categories:
         if not isinstance(category, Mapping):
             continue
@@ -149,6 +150,7 @@ def _find_automated_category_id(categories: Sequence[Mapping[str, Any]]) -> Opti
 
 
 def _merge_dict(target: MutableMapping[str, Any], updates: Mapping[str, Any]) -> None:
+    """Recursively merge Buildium metadata into the Firestore document payload."""
     for key, value in updates.items():
         if (
             key in target
@@ -165,6 +167,7 @@ def _select_first_value(
     *,
     candidates: Sequence[str],
 ) -> Optional[Any]:
+    """Support tolerant lookups across the many Buildium field aliases."""
     lowered = {key.lower() for key in candidates}
     for key, value in data.items():
         if str(key).lower() in lowered and value is not None:
@@ -175,6 +178,7 @@ def _select_first_value(
 def _normalize_gl_accounts(
     accounts: Sequence[Mapping[str, Any]]
 ) -> Sequence[Mapping[str, str]]:
+    """Coerce Buildium GL payloads into stable id/name pairs for Firestore."""
     normalized: list[Dict[str, str]] = []
     for account in accounts:
         if not isinstance(account, Mapping):
@@ -216,6 +220,7 @@ def _normalize_gl_accounts(
 def _build_onboarding_description(
     *, company: Mapping[str, Any], gl_accounts: Sequence[Mapping[str, Any]]
 ) -> str:
+    """Summarize key company data in a friendly onboarding checklist."""
     company_name = company.get("name") or company.get("legalName") or "your organization"
     account_lines = []
     for account in gl_accounts[:5]:
@@ -256,7 +261,11 @@ def handle_initiation_automation(
     firestore_client: Optional[Any] = None,
     buildium_api: Optional[BuildiumInitiationAPI] = None,
 ) -> None:
-    """Handle the Buildium Initiation automation flow."""
+    """Fetch Buildium metadata, merge it into Firestore, and create the onboarding task.
+
+    The handler keeps the account document up to date with GL mappings, company
+    context, and templates before opening a checklist assignment for the
+    property manager to confirm the configuration."""
 
     logger.info(
         "Starting Buildium initiation automation handler.",
