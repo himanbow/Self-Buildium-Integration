@@ -7,8 +7,10 @@ import base64
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from typing import Protocol
 
 from google.api_core import exceptions as google_exceptions
@@ -16,7 +18,9 @@ from google.cloud import tasks_v2
 
 from ..config import DEFAULT_GCP_PROJECT_ID
 from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
-from ..webhooks.verification import VerifiedBuildiumWebhook
+
+if TYPE_CHECKING:
+    from ..webhooks.verification import VerifiedBuildiumWebhook
 from .initiation import (
     FIRESTORE_COLLECTION_PATH as INITIATION_COLLECTION_PATH,
     INITIATION_COMPLETED_FIELD,
@@ -29,6 +33,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CLOUD_TASKS_QUEUE = "buildium-webhooks"
 _DEFAULT_CLOUD_TASKS_LOCATION = "us-central1"
 _DEFAULT_TASK_HANDLER_URL = "http://localhost:8080/tasks/buildium-webhook"
+
+# Buildium OpenAPI client path configuration for vendored SDK.
+_OPENAPI_CLIENT_PATH = Path(__file__).resolve().parents[2] / "clients" / "buildium"
+_OPENAPI_CLIENT_PATH_ADDED = False
+
+
+def _ensure_openapi_client_path() -> None:
+    global _OPENAPI_CLIENT_PATH_ADDED
+    if _OPENAPI_CLIENT_PATH_ADDED:
+        return
+
+    openapi_path = str(_OPENAPI_CLIENT_PATH)
+    if os.path.isdir(openapi_path) and openapi_path not in sys.path:
+        sys.path.insert(0, openapi_path)
+
+    _OPENAPI_CLIENT_PATH_ADDED = True
 
 CLOUD_TASKS_QUEUE_ENV = "CLOUD_TASKS_QUEUE"
 CLOUD_TASKS_LOCATION_ENV = "CLOUD_TASKS_LOCATION"
@@ -138,6 +158,26 @@ def _coerce_string(value: Any) -> Optional[str]:
         return None
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):  # pragma: no cover - defensive guard
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_secret_payload(secret_payload: str) -> Optional[Mapping[str, Any]]:
     payload = secret_payload.strip()
     if not payload:
@@ -161,7 +201,7 @@ def _extract_from_candidates(
     return None
 
 
-def _prepare_buildium_headers(verified_webhook: VerifiedBuildiumWebhook) -> Dict[str, str]:
+def _prepare_buildium_headers(verified_webhook: "VerifiedBuildiumWebhook") -> Dict[str, str]:
     """Build Buildium API headers from the stored account context.
 
     Parses the secret payload to prefer bearer tokens, with fallbacks for
@@ -248,7 +288,7 @@ def _resolve_project_id() -> Optional[str]:
     return default_project_id or None
 
 
-def _serialize_verified_webhook(verified_webhook: VerifiedBuildiumWebhook) -> Dict[str, Any]:
+def _serialize_verified_webhook(verified_webhook: "VerifiedBuildiumWebhook") -> Dict[str, Any]:
     headers: Mapping[str, Any]
     if isinstance(verified_webhook.envelope.headers, Mapping):
         headers = {str(key): str(value) for key, value in verified_webhook.envelope.headers.items()}
@@ -329,8 +369,36 @@ def _extract_task_data(webhook: Mapping[str, Any]) -> Optional[Mapping[str, Any]
     return None
 
 
+def _extract_task_identifier(webhook: Mapping[str, Any]) -> Optional[int]:
+    candidates: List[Mapping[str, Any]] = [webhook]
+    for key in ("task", "Task", "resource", "Resource", "event", "Event"):
+        value = webhook.get(key)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+
+    id_keys = (
+        "taskId",
+        "task_id",
+        "taskID",
+        "id",
+        "Id",
+        "resourceId",
+        "resource_id",
+        "ResourceId",
+        "ResourceID",
+    )
+
+    for candidate in candidates:
+        for key in id_keys:
+            if key in candidate:
+                identifier = _coerce_int(candidate.get(key))
+                if identifier is not None:
+                    return identifier
+    return None
+
+
 def _extract_task_name(task_data: Mapping[str, Any]) -> Optional[str]:
-    for key in ("taskName", "task_name", "name", "task"):
+    for key in ("taskName", "task_name", "name", "task", "title", "Title"):
         if key in task_data:
             task_name = _coerce_string(task_data[key])
             if task_name:
@@ -344,6 +412,7 @@ def _extract_task_category_name(task_data: Mapping[str, Any]) -> Optional[str]:
         "task_category_name",
         "categoryName",
         "category",
+        "Category",
     ):
         if key in task_data:
             category = task_data[key]
@@ -364,6 +433,89 @@ def _extract_task_category_name(task_data: Mapping[str, Any]) -> Optional[str]:
                 if nested_value:
                     return nested_value
     return None
+
+
+def _coerce_task_mapping(task: Any) -> Optional[Mapping[str, Any]]:
+    if isinstance(task, Mapping):
+        return dict(task)
+
+    for method_name in ("model_dump", "dict"):
+        method = getattr(task, method_name, None)
+        if callable(method):
+            try:
+                data = method(by_alias=True)
+            except TypeError:
+                data = method()
+            if isinstance(data, Mapping):
+                return dict(data)
+    return None
+
+
+def _build_tasks_api(api_headers: Mapping[str, Any]):
+    _ensure_openapi_client_path()
+    try:
+        from openapi_client.api_client import ApiClient
+        from openapi_client.api.tasks_api import TasksApi
+        from openapi_client.configuration import Configuration
+    except Exception:  # pragma: no cover - optional dependency safeguard
+        logger.exception("Buildium Tasks API client is unavailable.")
+        return None
+
+    configuration = Configuration()
+    api_client = ApiClient(configuration=configuration)
+    for header_name, header_value in api_headers.items():
+        coerced_name = _coerce_string(header_name)
+        coerced_value = _coerce_string(header_value)
+        if coerced_name and coerced_value:
+            api_client.set_default_header(coerced_name, coerced_value)
+
+    return TasksApi(api_client=api_client)
+
+
+def _fetch_task_data(
+    *,
+    api_headers: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    task_identifier: Optional[int],
+    webhook_payload: Mapping[str, Any],
+) -> Optional[Mapping[str, Any]]:
+    fallback_data = _extract_task_data(webhook_payload)
+
+    if task_identifier is None:
+        if fallback_data is None:
+            logger.debug(
+                "No task identifier found in Buildium webhook payload.",
+                extra={**metadata, "has_task_identifier": False},
+            )
+        return fallback_data
+
+    tasks_api = _build_tasks_api(api_headers)
+    if tasks_api is None:
+        logger.warning(
+            "Unable to initialize Buildium Tasks API client; using webhook payload data.",
+            extra={**metadata, "task_id": task_identifier},
+        )
+        return fallback_data
+
+    try:
+        task = tasks_api.get_task_by_id(task_id=task_identifier)
+    except Exception:
+        logger.warning(
+            "Failed to retrieve Buildium task details from API; using webhook payload data.",
+            exc_info=True,
+            extra={**metadata, "task_id": task_identifier},
+        )
+        return fallback_data
+
+    task_data = _coerce_task_mapping(task)
+    if not task_data:
+        logger.warning(
+            "Received empty Buildium task data from API; using webhook payload data.",
+            extra={**metadata, "task_id": task_identifier},
+        )
+        return fallback_data
+
+    return task_data
 
 
 def _select_automation_handler(
@@ -435,7 +587,7 @@ def _has_completed_initiation(*, account_id: str) -> bool:
 class BuildiumWebhookProcessor:
     """Prepare and execute a unit of Buildium webhook work."""
 
-    verified_webhook: VerifiedBuildiumWebhook
+    verified_webhook: "VerifiedBuildiumWebhook"
 
     def __post_init__(self) -> None:
         self._processing_context = BuildiumProcessingContext(
@@ -525,10 +677,11 @@ class BuildiumWebhookProcessor:
         handler. Passes the prepared account headers and GL mapping to the
         handler.
         """
+        metadata = dict(self.metadata)
         logger.info(
             "Dispatched Buildium webhook payload for downstream processing.",
             extra={
-                **self.metadata,
+                **metadata,
                 "payload_includes_gl_mapping": "gl_mapping" in payload,
             },
         )
@@ -537,17 +690,33 @@ class BuildiumWebhookProcessor:
         if not isinstance(webhook_payload, Mapping):
             logger.debug(
                 "Skipping Buildium webhook without structured task payload.",
-                extra={**self.metadata, "has_webhook_mapping": False},
+                extra={**metadata, "has_webhook_mapping": False},
             )
             return
 
-        task_data = _extract_task_data(webhook_payload)
+        webhook_payload = dict(webhook_payload)
+
+        raw_api_headers = payload.get("api_headers")
+        if isinstance(raw_api_headers, Mapping):
+            api_headers = dict(raw_api_headers)
+        else:
+            api_headers = dict(self._processing_context.api_headers)
+
+        task_identifier = _extract_task_identifier(webhook_payload)
+        task_data = _fetch_task_data(
+            api_headers=api_headers,
+            metadata=metadata,
+            task_identifier=task_identifier,
+            webhook_payload=webhook_payload,
+        )
         if task_data is None:
             logger.debug(
                 "No task details available in Buildium webhook payload.",
-                extra={**self.metadata, "has_task_data": False},
+                extra={**metadata, "has_task_data": False},
             )
             return
+
+        webhook_payload["task"] = dict(task_data)
 
         event_type = _extract_event_type(webhook_payload)
         task_name = _extract_task_name(task_data)
@@ -558,7 +727,7 @@ class BuildiumWebhookProcessor:
             logger.info(
                 "No automation handler registered for Buildium task payload.",
                 extra={
-                    **self.metadata,
+                    **metadata,
                     "event_type": event_type,
                     "task_name": task_name,
                 },
@@ -573,18 +742,13 @@ class BuildiumWebhookProcessor:
             logger.debug(
                 "Ignoring non-automated Buildium task payload.",
                 extra={
-                    **self.metadata,
+                    **metadata,
                     "task_category_name": task_category_name,
                 },
             )
             return
 
         account_id = _coerce_string(payload.get("account_id")) or self.verified_webhook.account_id
-        raw_api_headers = payload.get("api_headers")
-        if isinstance(raw_api_headers, Mapping):
-            api_headers = dict(raw_api_headers)
-        else:
-            api_headers = dict(self._processing_context.api_headers)
 
         raw_gl_mapping = payload.get("gl_mapping")
         gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
@@ -594,14 +758,14 @@ class BuildiumWebhookProcessor:
         ):
             logger.info(
                 "Skipping Buildium initiation automation; workflow already completed.",
-                extra={**self.metadata, "account_id": account_id},
+                extra={**metadata, "account_id": account_id},
             )
             return
 
         logger.info(
             "Dispatching Buildium automation task to handler.",
             extra={
-                **self.metadata,
+                **metadata,
                 "event_type": event_type,
                 "task_name": task_name,
                 "task_category_name": task_category_name,
@@ -618,7 +782,7 @@ class BuildiumWebhookProcessor:
 
 
 def enqueue_buildium_webhook(
-    verified_webhook: VerifiedBuildiumWebhook,
+    verified_webhook: "VerifiedBuildiumWebhook",
     *,
     client: Optional[tasks_v2.CloudTasksClient] = None,
 ) -> Any:
