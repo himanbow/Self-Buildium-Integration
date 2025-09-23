@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional
@@ -127,7 +128,48 @@ def _base_payload(webhook: Mapping[str, Any]) -> Mapping[str, Any]:
     }
 
 
-def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
+def _find_log(caplog, message: str) -> logging.LogRecord:
+    return next(record for record in caplog.records if record.getMessage() == message)
+
+
+def test_perform_work_logs_when_webhook_is_not_mapping(caplog) -> None:
+    processor = _make_processor({})
+    payload = dict(_base_payload({}))
+    payload["webhook"] = "invalid"
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    record = _find_log(
+        caplog, "Skipping Buildium webhook without structured task payload."
+    )
+    assert record.levelno == logging.INFO
+    assert record.has_webhook_mapping is False
+    assert record.task_identifier is None
+    assert record.event_type is None
+    assert record.task_category_name is None
+    assert record.configured_category_id is None
+
+
+def test_perform_work_logs_when_task_data_missing(monkeypatch, caplog) -> None:
+    processor = _make_processor({})
+    webhook_payload = {"eventType": "TaskCreated", "taskId": 555}
+    payload = _base_payload(webhook_payload)
+    _patch_tasks_api(monkeypatch, response=None)
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    record = _find_log(caplog, "No task details available in Buildium webhook payload.")
+    assert record.levelno == logging.INFO
+    assert record.has_task_data is False
+    assert record.task_identifier == 555
+    assert record.event_type == "TaskCreated"
+    assert record.task_category_name is None
+    assert record.configured_category_id is None
+
+
+def test_perform_work_ignores_non_automated_tasks(monkeypatch, caplog) -> None:
     processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
     webhook_payload = {
         "eventType": "TaskCreated",
@@ -157,11 +199,169 @@ def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
         },
     )
 
-    processor._perform_work(payload)
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
 
     mock_handler.assert_not_called()
     assert stub.calls == [101]
     assert headers == {"Authorization": "Bearer token"}
+
+    record = next(
+        entry
+        for entry in caplog.records
+        if entry.getMessage() == "Ignoring non-automated Buildium task payload."
+    )
+    assert record.levelno == logging.INFO
+    assert record.task_identifier == 101
+    assert record.event_type == "TaskCreated"
+    assert record.task_category_name == "General"
+    assert record.configured_category_id == _AUTOMATED_CATEGORY_ID
+    assert record.requires_automated_category is True
+    assert record.task_category_key == "general"
+
+
+def test_perform_work_logs_when_category_configuration_missing(monkeypatch, caplog) -> None:
+    processor = _make_processor({}, metadata={})
+    webhook_payload = {
+        "eventType": "TaskCreated",
+        "task": {
+            "taskName": "N1 Increase",
+            "taskCategoryName": "Automated Tasks",
+            "taskId": 202,
+        },
+    }
+    payload = _base_payload(webhook_payload)
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskcreated", "n1increase"): mock_handler},
+    )
+
+    _patch_tasks_api(
+        monkeypatch,
+        {
+            "Title": "N1 Increase",
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            },
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    mock_handler.assert_not_called()
+
+    record = _find_log(
+        caplog,
+        "Skipping Buildium automation without configured task category identifier.",
+    )
+    assert record.levelno == logging.WARNING
+    assert record.task_identifier == 202
+    assert record.event_type == "TaskCreated"
+    assert record.task_category_name == "Automated Tasks"
+    assert record.configured_category_id is None
+    assert record.task_category_id == _AUTOMATED_CATEGORY_ID
+
+
+def test_perform_work_logs_when_task_category_identifier_missing(
+    monkeypatch, caplog
+) -> None:
+    processor = _make_processor(
+        {}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID}
+    )
+    webhook_payload = {
+        "eventType": "TaskCreated",
+        "task": {
+            "taskName": "N1 Increase",
+            "taskCategoryName": "Automated Tasks",
+            "taskId": 303,
+        },
+    }
+    payload = _base_payload(webhook_payload)
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskcreated", "n1increase"): mock_handler},
+    )
+
+    _patch_tasks_api(
+        monkeypatch,
+        {
+            "Title": "N1 Increase",
+            "Category": {"taskCategoryName": "Automated Tasks"},
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    mock_handler.assert_not_called()
+
+    record = _find_log(
+        caplog, "Skipping Buildium automation without task category identifier."
+    )
+    assert record.levelno == logging.INFO
+    assert record.task_identifier == 303
+    assert record.event_type == "TaskCreated"
+    assert record.task_category_name == "Automated Tasks"
+    assert record.configured_category_id == _AUTOMATED_CATEGORY_ID
+
+
+def test_perform_work_logs_when_task_category_identifier_mismatched(
+    monkeypatch, caplog
+) -> None:
+    processor = _make_processor(
+        {}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID}
+    )
+    webhook_payload = {
+        "eventType": "TaskCreated",
+        "task": {
+            "taskName": "N1 Increase",
+            "taskCategoryName": "Automated Tasks",
+            "taskId": 404,
+        },
+    }
+    payload = _base_payload(webhook_payload)
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskcreated", "n1increase"): mock_handler},
+    )
+
+    _patch_tasks_api(
+        monkeypatch,
+        {
+            "Title": "N1 Increase",
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": "cat-other",
+            },
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    mock_handler.assert_not_called()
+
+    record = _find_log(
+        caplog,
+        "Ignoring Buildium task with mismatched automation category identifier.",
+    )
+    assert record.levelno == logging.WARNING
+    assert record.task_identifier == 404
+    assert record.event_type == "TaskCreated"
+    assert record.task_category_name == "Automated Tasks"
+    assert record.configured_category_id == _AUTOMATED_CATEGORY_ID
+    assert record.task_category_id == "cat-other"
 
 
 def test_perform_work_routes_automated_tasks(monkeypatch) -> None:

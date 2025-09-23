@@ -726,10 +726,34 @@ class BuildiumWebhookProcessor:
         )
 
         webhook_payload = payload.get("webhook")
+
+        task_identifier: Optional[int] = None
+        event_type: Optional[str] = None
+        task_category_name: Optional[str] = None
+        configured_category_id: Optional[str] = None
+
+        account_metadata = self.verified_webhook.account_context.metadata
+        if isinstance(account_metadata, Mapping):
+            configured_category_id = _coerce_string(
+                account_metadata.get(_AUTOMATED_CATEGORY_METADATA_KEY)
+            )
+            if isinstance(configured_category_id, str):
+                configured_category_id = configured_category_id.strip() or None
+
+        def _log_extra(**kwargs: Any) -> Dict[str, Any]:
+            return {
+                **metadata,
+                "task_identifier": task_identifier,
+                "event_type": event_type,
+                "task_category_name": task_category_name,
+                "configured_category_id": configured_category_id,
+                **kwargs,
+            }
+
         if not isinstance(webhook_payload, Mapping):
-            logger.debug(
+            logger.info(
                 "Skipping Buildium webhook without structured task payload.",
-                extra={**metadata, "has_webhook_mapping": False},
+                extra=_log_extra(has_webhook_mapping=False),
             )
             return
 
@@ -742,6 +766,7 @@ class BuildiumWebhookProcessor:
             api_headers = dict(self._processing_context.api_headers)
 
         task_identifier = _extract_task_identifier(webhook_payload)
+        event_type = _extract_event_type(webhook_payload)
         task_data = _fetch_task_data(
             api_headers=api_headers,
             metadata=metadata,
@@ -749,15 +774,14 @@ class BuildiumWebhookProcessor:
             webhook_payload=webhook_payload,
         )
         if task_data is None:
-            logger.debug(
+            logger.info(
                 "No task details available in Buildium webhook payload.",
-                extra={**metadata, "has_task_data": False},
+                extra=_log_extra(has_task_data=False),
             )
             return
 
         webhook_payload["task"] = dict(task_data)
 
-        event_type = _extract_event_type(webhook_payload)
         task_name = _extract_task_name(task_data)
         event_key = _normalize_identifier(event_type)
         task_key = _normalize_identifier(task_name)
@@ -780,12 +804,12 @@ class BuildiumWebhookProcessor:
         task_category_name = _extract_task_category_name(task_data)
         category_key = _normalize_identifier(task_category_name)
         if requires_automated_category and (category_key != _AUTOMATED_TASKS_KEY):
-            logger.debug(
+            logger.info(
                 "Ignoring non-automated Buildium task payload.",
-                extra={
-                    **metadata,
-                    "task_category_name": task_category_name,
-                },
+                extra=_log_extra(
+                    requires_automated_category=requires_automated_category,
+                    task_category_key=category_key,
+                ),
             )
             return
 
@@ -794,43 +818,32 @@ class BuildiumWebhookProcessor:
         raw_gl_mapping = payload.get("gl_mapping")
         gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
 
-        configured_category_id: Optional[str] = None
-        account_metadata = self.verified_webhook.account_context.metadata
-        if isinstance(account_metadata, Mapping):
-            configured_category_id = _coerce_string(
-                account_metadata.get(_AUTOMATED_CATEGORY_METADATA_KEY)
-            )
-            if isinstance(configured_category_id, str):
-                configured_category_id = configured_category_id.strip() or None
-
         if requires_automated_category:
             task_category_id = _extract_task_category_identifier(task_data)
             if not configured_category_id:
-                logger.debug(
+                logger.warning(
                     "Skipping Buildium automation without configured task category identifier.",
-                    extra={
-                        **metadata,
-                        "task_category_id": task_category_id,
-                    },
+                    extra=_log_extra(
+                        task_category_id=task_category_id,
+                        configured_task_category_id=configured_category_id,
+                    ),
                 )
                 return
             if not task_category_id:
-                logger.debug(
+                logger.info(
                     "Skipping Buildium automation without task category identifier.",
-                    extra={
-                        **metadata,
-                        "configured_task_category_id": configured_category_id,
-                    },
+                    extra=_log_extra(
+                        configured_task_category_id=configured_category_id,
+                    ),
                 )
                 return
             if task_category_id != configured_category_id:
-                logger.debug(
+                logger.warning(
                     "Ignoring Buildium task with mismatched automation category identifier.",
-                    extra={
-                        **metadata,
-                        "task_category_id": task_category_id,
-                        "configured_task_category_id": configured_category_id,
-                    },
+                    extra=_log_extra(
+                        task_category_id=task_category_id,
+                        configured_task_category_id=configured_category_id,
+                    ),
                 )
                 return
 
