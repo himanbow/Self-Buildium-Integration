@@ -41,7 +41,7 @@ _DEFAULT_CLOUD_TASKS_LOCATION = "us-central1"
 _DEFAULT_TASK_HANDLER_URL = "http://localhost:8080/tasks/buildium-webhook"
 
 # Buildium OpenAPI client path configuration for vendored SDK.
-_OPENAPI_CLIENT_PATH = Path(__file__).resolve().parents[2] / "clients" / "buildium"
+_OPENAPI_CLIENT_PATH = Path(__file__).resolve().parents[1] / "clients" / "buildium"
 _OPENAPI_CLIENT_PATH_ADDED = False
 
 
@@ -52,7 +52,7 @@ def _ensure_openapi_client_path() -> None:
 
     openapi_path = str(_OPENAPI_CLIENT_PATH)
     if os.path.isdir(openapi_path) and openapi_path not in sys.path:
-        sys.path.insert(0, openapi_path)
+        sys.path.append(openapi_path)
 
     _OPENAPI_CLIENT_PATH_ADDED = True
 

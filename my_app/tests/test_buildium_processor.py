@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional
@@ -77,6 +78,28 @@ def _patch_tasks_api(
 
     monkeypatch.setattr(buildium_processor, "_build_tasks_api", _factory)
     return stub, captured_headers
+
+
+def test_build_tasks_api_uses_vendored_client(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(buildium_processor, "_OPENAPI_CLIENT_PATH_ADDED", False)
+
+    to_remove = [
+        name
+        for name in sys.modules
+        if name == "openapi_client" or name.startswith("openapi_client.")
+    ]
+    for module_name in to_remove:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    tasks_api = buildium_processor._build_tasks_api({"Authorization": "Bearer token"})
+
+    from openapi_client.api.tasks_api import TasksApi
+
+    assert tasks_api is not None
+    assert isinstance(tasks_api, TasksApi)
+    assert str(buildium_processor._OPENAPI_CLIENT_PATH) in sys.path
+    assert tasks_api.api_client.default_headers.get("Authorization") == "Bearer token"
 
 
 def _make_processor(
