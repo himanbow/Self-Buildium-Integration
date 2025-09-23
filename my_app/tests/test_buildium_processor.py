@@ -24,6 +24,7 @@ VerifiedBuildiumWebhook = importlib.import_module(
 
 
 _AUTOMATED_CATEGORY_ID = "cat-automated"
+_TASK_DETAILS_MESSAGE = "Resolved Buildium task details for automation processing."
 
 
 @dataclass(frozen=True)
@@ -580,7 +581,46 @@ def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
     assert stub.calls == [402]
 
 
-def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
+def test_perform_work_logs_task_resolution_from_api(monkeypatch, caplog) -> None:
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
+
+    webhook_payload = {"eventType": "TaskCreated", "task": {"taskId": 202}}
+    payload = _base_payload(webhook_payload)
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskcreated", "initiation"): mock_handler},
+    )
+
+    _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 202,
+            "Title": "Initiation",
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            },
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
+
+    mock_handler.assert_called_once()
+
+    record = _find_log(caplog, _TASK_DETAILS_MESSAGE)
+    assert record.levelno == logging.INFO
+    assert record.task_data_source == "api"
+    assert record.task_identifier == 202
+    assert record.task_name == "Initiation"
+    assert record.task_category_name == "Automated Tasks"
+    assert record.task_category_id == _AUTOMATED_CATEGORY_ID
+
+
+def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch, caplog) -> None:
     processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
 
     webhook_payload = {
@@ -588,7 +628,7 @@ def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
         "task": {
             "taskName": "N1 Increase",
             "taskCategoryName": "Automated Tasks",
-            "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            "taskCategoryId": f"  {_AUTOMATED_CATEGORY_ID}  ",
             "taskId": 909,
         },
     }
@@ -614,13 +654,22 @@ def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
         side_effect=RuntimeError("boom"),
     )
 
-    processor._perform_work(payload)
+    with caplog.at_level(logging.INFO):
+        processor._perform_work(payload)
 
     mock_handler.assert_called_once()
     call = mock_handler.call_args
     assert call.kwargs["webhook"]["task"] == webhook_payload["task"]
     assert stub.calls == [909]
     assert headers == {"Authorization": "Bearer token"}
+
+    record = _find_log(caplog, _TASK_DETAILS_MESSAGE)
+    assert record.levelno == logging.INFO
+    assert record.task_data_source == "webhook"
+    assert record.task_identifier == 909
+    assert record.task_name == "N1 Increase"
+    assert record.task_category_name == "Automated Tasks"
+    assert record.task_category_id == _AUTOMATED_CATEGORY_ID
 
 
 def test_enqueue_buildium_webhook_creates_cloud_task(monkeypatch) -> None:

@@ -338,6 +338,9 @@ _AUTOMATION_ROUTING_TABLE: Dict[Tuple[str, str], AutomationHandler] = {
     ("taskstatuschanged", "n1increase"): handle_n1_increase_automation,
 }
 
+_TASK_DATA_SOURCE_API = "api"
+_TASK_DATA_SOURCE_WEBHOOK = "webhook"
+
 _AUTOMATED_CATEGORY_METADATA_KEY = "automated_tasks_category_id"
 
 
@@ -517,8 +520,9 @@ def _fetch_task_data(
     metadata: Mapping[str, Any],
     task_identifier: Optional[int],
     webhook_payload: Mapping[str, Any],
-) -> Optional[Mapping[str, Any]]:
+) -> Tuple[Optional[Mapping[str, Any]], str]:
     fallback_data = _extract_task_data(webhook_payload)
+    fallback_source = _TASK_DATA_SOURCE_WEBHOOK
 
     if task_identifier is None:
         if fallback_data is None:
@@ -526,7 +530,7 @@ def _fetch_task_data(
                 "No task identifier found in Buildium webhook payload.",
                 extra={**metadata, "has_task_identifier": False},
             )
-        return fallback_data
+        return fallback_data, fallback_source
 
     tasks_api = _build_tasks_api(api_headers)
     if tasks_api is None:
@@ -534,7 +538,7 @@ def _fetch_task_data(
             "Unable to initialize Buildium Tasks API client; using webhook payload data.",
             extra={**metadata, "task_id": task_identifier},
         )
-        return fallback_data
+        return fallback_data, fallback_source
 
     try:
         task = tasks_api.get_task_by_id(task_id=task_identifier)
@@ -544,7 +548,7 @@ def _fetch_task_data(
             exc_info=True,
             extra={**metadata, "task_id": task_identifier},
         )
-        return fallback_data
+        return fallback_data, fallback_source
 
     task_data = _coerce_task_mapping(task)
     if not task_data:
@@ -552,9 +556,9 @@ def _fetch_task_data(
             "Received empty Buildium task data from API; using webhook payload data.",
             extra={**metadata, "task_id": task_identifier},
         )
-        return fallback_data
+        return fallback_data, fallback_source
 
-    return task_data
+    return task_data, _TASK_DATA_SOURCE_API
 
 
 def _select_automation_handler(
@@ -730,6 +734,7 @@ class BuildiumWebhookProcessor:
         task_identifier: Optional[int] = None
         event_type: Optional[str] = None
         task_category_name: Optional[str] = None
+        task_category_id: Optional[str] = None
         configured_category_id: Optional[str] = None
 
         account_metadata = self.verified_webhook.account_context.metadata
@@ -767,7 +772,7 @@ class BuildiumWebhookProcessor:
 
         task_identifier = _extract_task_identifier(webhook_payload)
         event_type = _extract_event_type(webhook_payload)
-        task_data = _fetch_task_data(
+        task_data, task_data_source = _fetch_task_data(
             api_headers=api_headers,
             metadata=metadata,
             task_identifier=task_identifier,
@@ -783,6 +788,18 @@ class BuildiumWebhookProcessor:
         webhook_payload["task"] = dict(task_data)
 
         task_name = _extract_task_name(task_data)
+        task_category_name = _extract_task_category_name(task_data)
+        task_category_id = _extract_task_category_identifier(task_data)
+
+        logger.info(
+            "Resolved Buildium task details for automation processing.",
+            extra=_log_extra(
+                task_data_source=task_data_source,
+                task_name=task_name,
+                task_category_id=task_category_id,
+            ),
+        )
+
         event_key = _normalize_identifier(event_type)
         task_key = _normalize_identifier(task_name)
         handler = _select_automation_handler(event_type=event_type, task_name=task_name)
@@ -800,8 +817,6 @@ class BuildiumWebhookProcessor:
         requires_automated_category = _requires_automated_category(
             event_key=event_key, task_key=task_key
         )
-
-        task_category_name = _extract_task_category_name(task_data)
         category_key = _normalize_identifier(task_category_name)
         if requires_automated_category and (category_key != _AUTOMATED_TASKS_KEY):
             logger.info(
@@ -819,7 +834,6 @@ class BuildiumWebhookProcessor:
         gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
 
         if requires_automated_category:
-            task_category_id = _extract_task_category_identifier(task_data)
             if not configured_category_id:
                 logger.warning(
                     "Skipping Buildium automation without configured task category identifier.",
