@@ -358,22 +358,35 @@ def _normalize_identifier(value: Optional[str]) -> Optional[str]:
 
 
 def _extract_event_type(webhook: Mapping[str, Any]) -> Optional[str]:
-    for key in ("eventType", "event_type", "type"):
+    # Flat keys
+    for key in (
+        "EventName", "eventName",
+        "EventType", "eventType",
+        "event_type", "eventType",
+        "type",
+    ):
         if key in webhook:
             event_type = _coerce_string(webhook[key])
             if event_type:
                 return event_type
-    event_block = webhook.get("event")
+
+    # Nested event blocks
+    event_block = webhook.get("event") or webhook.get("Event")
     if isinstance(event_block, Mapping):
-        for key in ("eventType", "event_type", "type"):
-            event_type = _coerce_string(event_block.get(key))
-            if event_type:
-                return event_type
+        for key in (
+            "EventName", "eventName",
+            "EventType", "eventType",
+            "event_type", "type",
+        ):
+            if key in event_block:
+                event_type = _coerce_string(event_block.get(key))
+                if event_type:
+                    return event_type
     return None
 
 
 def _extract_task_data(webhook: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    for key in ("task", "Task", "resource", "Resource"):
+    for key in ("task", "Task", "resource", "Resource", "data", "Data"):
         value = webhook.get(key)
         if isinstance(value, Mapping):
             return value
@@ -382,21 +395,17 @@ def _extract_task_data(webhook: Mapping[str, Any]) -> Optional[Mapping[str, Any]
 
 def _extract_task_identifier(webhook: Mapping[str, Any]) -> Optional[int]:
     candidates: List[Mapping[str, Any]] = [webhook]
-    for key in ("task", "Task", "resource", "Resource", "event", "Event"):
+    for key in ("task", "Task", "resource", "Resource", "event", "Event", "data", "Data"):
         value = webhook.get(key)
         if isinstance(value, Mapping):
             candidates.append(value)
 
     id_keys = (
-        "taskId",
-        "task_id",
-        "taskID",
-        "id",
-        "Id",
-        "resourceId",
-        "resource_id",
-        "ResourceId",
-        "ResourceID",
+        # Explicit task id variants
+        "TaskId", "TaskID", "taskId", "taskID", "task_id",
+        # Generic id / resource id variants
+        "id", "Id", "ID",
+        "resourceId", "resource_id", "ResourceId", "ResourceID",
     )
 
     for candidate in candidates:
@@ -406,7 +415,6 @@ def _extract_task_identifier(webhook: Mapping[str, Any]) -> Optional[int]:
                 if identifier is not None:
                     return identifier
     return None
-
 
 def _extract_task_name(task_data: Mapping[str, Any]) -> Optional[str]:
     for key in ("taskName", "task_name", "name", "task", "title", "Title"):
