@@ -338,6 +338,8 @@ _AUTOMATION_ROUTING_TABLE: Dict[Tuple[str, str], AutomationHandler] = {
     ("taskstatuschanged", "n1increase"): handle_n1_increase_automation,
 }
 
+_AUTOMATED_CATEGORY_METADATA_KEY = "automated_tasks_category_id"
+
 
 def _normalize_identifier(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -432,6 +434,43 @@ def _extract_task_category_name(task_data: Mapping[str, Any]) -> Optional[str]:
                 nested_value = _coerce_string(category_block.get(nested_key))
                 if nested_value:
                     return nested_value
+    return None
+
+
+def _extract_task_category_identifier(task_data: Mapping[str, Any]) -> Optional[str]:
+    identifier_keys = (
+        "taskCategoryId",
+        "task_category_id",
+        "taskCategoryID",
+        "task_categoryid",
+        "taskcategoryid",
+        "categoryId",
+        "category_id",
+        "CategoryId",
+        "CategoryID",
+    )
+
+    def _normalize(value: Any) -> Optional[str]:
+        identifier = _coerce_string(value)
+        if isinstance(identifier, str):
+            identifier = identifier.strip()
+        return identifier or None
+
+    for key in identifier_keys:
+        if key in task_data:
+            normalized = _normalize(task_data.get(key))
+            if normalized:
+                return normalized
+
+    for key in ("taskCategory", "task_category", "Category", "category"):
+        category_block = task_data.get(key)
+        if not isinstance(category_block, Mapping):
+            continue
+        for nested_key in ("id", "Id", "ID", *identifier_keys):
+            if nested_key in category_block:
+                normalized = _normalize(category_block.get(nested_key))
+                if normalized:
+                    return normalized
     return None
 
 
@@ -734,11 +773,13 @@ class BuildiumWebhookProcessor:
             )
             return
 
+        requires_automated_category = _requires_automated_category(
+            event_key=event_key, task_key=task_key
+        )
+
         task_category_name = _extract_task_category_name(task_data)
         category_key = _normalize_identifier(task_category_name)
-        if _requires_automated_category(event_key=event_key, task_key=task_key) and (
-            category_key != _AUTOMATED_TASKS_KEY
-        ):
+        if requires_automated_category and (category_key != _AUTOMATED_TASKS_KEY):
             logger.debug(
                 "Ignoring non-automated Buildium task payload.",
                 extra={
@@ -752,6 +793,46 @@ class BuildiumWebhookProcessor:
 
         raw_gl_mapping = payload.get("gl_mapping")
         gl_mapping: Mapping[str, Any] = dict(raw_gl_mapping) if isinstance(raw_gl_mapping, Mapping) else {}
+
+        configured_category_id: Optional[str] = None
+        account_metadata = self.verified_webhook.account_context.metadata
+        if isinstance(account_metadata, Mapping):
+            configured_category_id = _coerce_string(
+                account_metadata.get(_AUTOMATED_CATEGORY_METADATA_KEY)
+            )
+            if isinstance(configured_category_id, str):
+                configured_category_id = configured_category_id.strip() or None
+
+        if requires_automated_category:
+            task_category_id = _extract_task_category_identifier(task_data)
+            if not configured_category_id:
+                logger.debug(
+                    "Skipping Buildium automation without configured task category identifier.",
+                    extra={
+                        **metadata,
+                        "task_category_id": task_category_id,
+                    },
+                )
+                return
+            if not task_category_id:
+                logger.debug(
+                    "Skipping Buildium automation without task category identifier.",
+                    extra={
+                        **metadata,
+                        "configured_task_category_id": configured_category_id,
+                    },
+                )
+                return
+            if task_category_id != configured_category_id:
+                logger.debug(
+                    "Ignoring Buildium task with mismatched automation category identifier.",
+                    extra={
+                        **metadata,
+                        "task_category_id": task_category_id,
+                        "configured_task_category_id": configured_category_id,
+                    },
+                )
+                return
 
         if (event_key, task_key) == _INITIATION_AUTOMATION_KEY and _has_completed_initiation(
             account_id=account_id

@@ -22,6 +22,9 @@ VerifiedBuildiumWebhook = importlib.import_module(
 ).VerifiedBuildiumWebhook
 
 
+_AUTOMATED_CATEGORY_ID = "cat-automated"
+
+
 @dataclass(frozen=True)
 class _StubAccountContext:
     account_id: str
@@ -74,10 +77,12 @@ def _patch_tasks_api(
     return stub, captured_headers
 
 
-def _make_processor(parsed_body: Mapping[str, Any]) -> Any:
+def _make_processor(
+    parsed_body: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None
+) -> Any:
     account_context = _StubAccountContext(
         account_id="acct-123",
-        metadata={},
+        metadata=dict(metadata or {}),
         api_secret="",
         webhook_secret="secret",
     )
@@ -123,7 +128,7 @@ def _base_payload(webhook: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
-    processor = _make_processor({})
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
     webhook_payload = {
         "eventType": "TaskCreated",
         "task": {
@@ -143,7 +148,13 @@ def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
 
     stub, headers = _patch_tasks_api(
         monkeypatch,
-        {"Title": "Initiation", "Category": {"taskCategoryName": "General"}},
+        {
+            "Title": "Initiation",
+            "Category": {
+                "taskCategoryName": "General",
+                "taskCategoryId": "cat-general",
+            },
+        },
     )
 
     processor._perform_work(payload)
@@ -154,7 +165,7 @@ def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
 
 
 def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
-    processor = _make_processor({})
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
 
     initiation_webhook = {
         "eventType": "TaskCreated",
@@ -189,7 +200,10 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
         {
             "Id": 202,
             "Title": "Initiation",
-            "Category": {"taskCategoryName": "Automated Tasks"},
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            },
         },
     )
 
@@ -205,7 +219,10 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
     assert init_call.kwargs["webhook"]["task"] == {
         "Id": 202,
         "Title": "Initiation",
-        "Category": {"taskCategoryName": "Automated Tasks"},
+        "Category": {
+            "taskCategoryName": "Automated Tasks",
+            "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+        },
     }
 
     n1_stub, n1_headers = _patch_tasks_api(
@@ -213,7 +230,10 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
         {
             "Id": 303,
             "Title": "N1 Increase",
-            "Category": {"taskCategoryName": "Automated Tasks"},
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            },
         },
     )
 
@@ -229,12 +249,53 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
     assert n1_call.kwargs["webhook"]["task"] == {
         "Id": 303,
         "Title": "N1 Increase",
-        "Category": {"taskCategoryName": "Automated Tasks"},
+        "Category": {
+            "taskCategoryName": "Automated Tasks",
+            "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+        },
     }
 
 
+def test_perform_work_skips_when_category_identifier_mismatch(monkeypatch) -> None:
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
+
+    webhook_payload = {
+        "eventType": "TaskStatusChanged",
+        "task": {
+            "taskName": "N1 Increase",
+            "taskCategoryName": "Automated Tasks",
+            "taskId": 707,
+        },
+    }
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskstatuschanged", "n1increase"): mock_handler},
+    )
+
+    stub, _ = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 707,
+            "Title": "N1 Increase",
+            "taskCategoryId": "cat-other",
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": "cat-other",
+            },
+        },
+    )
+
+    processor._perform_work(_base_payload(webhook_payload))
+
+    mock_handler.assert_not_called()
+    assert stub.calls == [707]
+
+
 def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
-    processor = _make_processor({})
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
 
     initiation_webhook = {
         "eventType": "TaskCreated",
@@ -262,7 +323,10 @@ def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
         {
             "Id": 401,
             "Title": "Ontario Automations Initiation",
-            "Category": {"taskCategoryName": "General"},
+            "Category": {
+                "taskCategoryName": "General",
+                "taskCategoryId": "cat-general",
+            },
         },
     )
 
@@ -273,7 +337,7 @@ def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
 
 
 def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
-    processor = _make_processor({})
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
 
     initiation_webhook = {
         "eventType": "TaskCreated",
@@ -303,7 +367,10 @@ def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
         {
             "Id": 402,
             "Title": "Ontario Automations Initiation",
-            "Category": {"taskCategoryName": "General"},
+            "Category": {
+                "taskCategoryName": "General",
+                "taskCategoryId": "cat-general",
+            },
         },
     )
 
@@ -314,13 +381,14 @@ def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
 
 
 def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
-    processor = _make_processor({})
+    processor = _make_processor({}, metadata={"automated_tasks_category_id": _AUTOMATED_CATEGORY_ID})
 
     webhook_payload = {
         "eventType": "TaskStatusChanged",
         "task": {
             "taskName": "N1 Increase",
             "taskCategoryName": "Automated Tasks",
+            "taskCategoryId": _AUTOMATED_CATEGORY_ID,
             "taskId": 909,
         },
     }
@@ -338,7 +406,10 @@ def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
         {
             "Id": 909,
             "Title": "N1 Increase",
-            "Category": {"taskCategoryName": "Automated Tasks"},
+            "Category": {
+                "taskCategoryName": "Automated Tasks",
+                "taskCategoryId": _AUTOMATED_CATEGORY_ID,
+            },
         },
         side_effect=RuntimeError("boom"),
     )
