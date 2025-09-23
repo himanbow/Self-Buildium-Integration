@@ -128,7 +128,7 @@ def test_handle_initiation_persists_metadata_and_creates_task() -> None:
         assert isinstance(account["id"], str)
     assert persisted["gl_mapping"] == {"4000": "Income"}
     assert persisted["document_templates"][0]["name"] == "N1 Template"
-    assert persisted[initiation.INITIATION_COMPLETED_FIELD] is True
+    assert persisted["initiation_completed"] is True
 
     assert api.created_tasks, "Expected onboarding task to be created"
     task = api.created_tasks[0]

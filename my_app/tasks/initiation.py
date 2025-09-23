@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 FIRESTORE_COLLECTION_PATH = "buildium_accounts"
 AUTOMATED_TASK_CATEGORY_NAME = "Automated Tasks"
-INITIATION_COMPLETED_FIELD = "initiation_automation_completed"
+INITIATION_COMPLETED_FIELD = "initiation_completed"
 
 
 class BuildiumInitiationAPI(Protocol):
