@@ -114,6 +114,14 @@ class FakeBuildiumAPI:
         self.updated_leases: List[Mapping[str, Any]] = []
         self.extended_leases: List[Mapping[str, Any]] = []
         self.created_tasks: List[Mapping[str, Any]] = []
+        self.task_categories: List[Mapping[str, Any]] = [
+            {"id": "cat-1", "name": "Automation"}
+        ]
+        self.task_comments: List[Mapping[str, Any]] = []
+        self.lease_renewals: List[Mapping[str, Any]] = []
+        self.presign_requests: List[Mapping[str, Any]] = []
+        self.presigned_uploads: List[Mapping[str, Any]] = []
+        self._next_task_id = 1
 
     def list_eligible_leases(self) -> Sequence[Mapping[str, Any]]:
         return list(self.leases)
@@ -177,13 +185,77 @@ class FakeBuildiumAPI:
         name: str,
         description: str,
     ) -> Mapping[str, Any]:
+        task_id = f"task-{self._next_task_id}"
+        self._next_task_id += 1
         payload = {
             "category_id": category_id,
             "name": name,
             "description": description,
+            "id": task_id,
         }
         self.created_tasks.append(payload)
         return payload
+
+    def create_task_history_comment(
+        self, *, task_id: str, body: str
+    ) -> Mapping[str, Any]:
+        payload = {"task_id": task_id, "body": body}
+        self.task_comments.append(payload)
+        return payload
+
+    def list_task_categories(self) -> Sequence[Mapping[str, Any]]:
+        return [dict(item) for item in self.task_categories]
+
+    def create_task_category(self, *, name: str) -> Mapping[str, Any]:
+        identifier = f"cat-{len(self.task_categories) + 1}"
+        payload = {"id": identifier, "name": name}
+        self.task_categories.append(payload)
+        return payload
+
+    def create_lease_renewal(
+        self, *, lease_id: str, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        record = {"lease_id": lease_id, "payload": dict(payload)}
+        self.lease_renewals.append(record)
+        return record
+
+    def request_presigned_upload(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        response = {
+            "url": f"https://uploads.example/{filename}",
+            "fields": {"key": filename},
+        }
+        self.presign_requests.append(
+            {
+                "filename": filename,
+                "content_type": content_type,
+                "metadata": dict(metadata or {}),
+                "response": response,
+            }
+        )
+        return response
+
+    def upload_to_presigned_url(
+        self,
+        *,
+        url: str,
+        fields: Mapping[str, Any],
+        content: bytes,
+        content_type: str,
+    ) -> Mapping[str, Any]:
+        record = {
+            "url": url,
+            "fields": dict(fields),
+            "content": content,
+            "content_type": content_type,
+        }
+        self.presigned_uploads.append(record)
+        return {"status": "ok"}
 
 
 def _decode_excel(excel_b64: str) -> str:
@@ -384,5 +456,208 @@ def test_handle_n1_completion_generates_documents(monkeypatch) -> None:
     assert any("Property One" in name for name in tasks_by_property)
     assert any("Property Two" in name for name in tasks_by_property)
 
+    assert len(api.presign_requests) == 2
+    assert {entry["filename"] for entry in api.presign_requests} == {
+        "N1 Summary.xlsx",
+        "N1 Summary.pdf",
+    }
+    assert {upload["content"] for upload in api.presigned_uploads} == {b"excel", b"pdf"}
+
     document = firestore.collection_instance.document("acct-1")
-    assert document.data["n1_increase"]["forms_uploaded"] == 2
+    n1_block = document.data["n1_increase"]
+    assert n1_block["forms_uploaded"] == 2
+    assert "summary_uploads" in n1_block
+    assert {
+        entry["filename"] for entry in n1_block["summary_uploads"]
+    } == {"N1 Summary.xlsx", "N1 Summary.pdf"}
+
+    property_tasks = n1_block.get("property_tasks") or {}
+    assert property_tasks["prop-1"]["status"] == "created"
+    assert property_tasks["prop-2"]["status"] == "created"
+
+
+def test_handle_n1_completion_creates_lease_renewals() -> None:
+    api = FakeBuildiumAPI()
+    schedule = {
+        "lease_id": "lease-1",
+        "property_id": "prop-1",
+        "unit_id": "unit-1",
+        "property_name": "Property One",
+        "unit_name": "101",
+        "current_rent": "1200.00",
+        "new_rent": "1236.00",
+        "increase_rate": "0.03",
+        "increase_rate_percent": "3.00%",
+        "increase_amount": "36.00",
+        "effective_date": "2024-09-01",
+        "is_extended": False,
+        "extension_end_date": None,
+    }
+
+    payload_entries = [
+        {
+            "schedule": schedule,
+            "lease": {"id": "lease-1", "effective_date": "2024-09-01"},
+        }
+    ]
+    chunks = n1_data_module.build_encrypted_chunks(
+        payload_entries, max_bytes=1024, encryption_secret=n1_data_module.ENCRYPTION_SECRET
+    )
+
+    firestore = FakeFirestore(
+        initial_docs={
+            "acct-1": {
+                "n1_increase": {
+                    "schedules": [schedule],
+                    "payload_chunks": chunks,
+                    "lease_renewals": {
+                        "lease-1": {
+                            "startDate": "2024-09-01",
+                            "endDate": "2025-08-31",
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+    webhook = {"eventType": "TaskStatusChanged", "task": {"status": "Completed"}}
+
+    n1_increase.handle_n1_increase_automation(
+        account_id="acct-1",
+        api_headers={"Authorization": "Bearer token"},
+        gl_mapping={},
+        webhook=webhook,
+        firestore_client=firestore,
+        buildium_api=api,
+    )
+
+    assert len(api.lease_renewals) == 1
+    renewal = api.lease_renewals[0]
+    assert renewal["lease_id"] == "lease-1"
+    payload = renewal["payload"]
+    assert payload["leaseId"] == "lease-1"
+    assert payload["startDate"] == "2024-09-01"
+    assert payload["endDate"] == "2025-08-31"
+    assert float(payload["rentAmount"]) == 1236.0
+
+
+def test_handle_n1_completion_skips_ignored_leases() -> None:
+    api = FakeBuildiumAPI()
+    schedules = [
+        {
+            "lease_id": "lease-1",
+            "property_id": "prop-1",
+            "unit_id": "unit-1",
+            "property_name": "Property One",
+            "unit_name": "101",
+            "current_rent": "1200.00",
+            "new_rent": "1236.00",
+            "increase_rate": "0.03",
+            "increase_rate_percent": "3.00%",
+            "increase_amount": "36.00",
+            "effective_date": "2024-09-01",
+            "is_extended": False,
+            "extension_end_date": None,
+        },
+        {
+            "lease_id": "lease-2",
+            "property_id": "prop-2",
+            "unit_id": "unit-2",
+            "property_name": "Property Two",
+            "unit_name": "201",
+            "current_rent": "1500.00",
+            "new_rent": "1537.50",
+            "increase_rate": "0.025",
+            "increase_rate_percent": "2.50%",
+            "increase_amount": "37.50",
+            "effective_date": "2024-09-01",
+            "is_extended": False,
+            "extension_end_date": None,
+        },
+    ]
+
+    firestore = FakeFirestore(
+        initial_docs={
+            "acct-1": {
+                "n1_increase": {
+                    "schedules": schedules,
+                    "payload_chunks": [],
+                    "ignored_leases": ["lease-2"],
+                }
+            }
+        }
+    )
+
+    webhook = {"eventType": "TaskStatusChanged", "task": {"status": "Completed"}}
+
+    n1_increase.handle_n1_increase_automation(
+        account_id="acct-1",
+        api_headers={"Authorization": "Bearer token"},
+        gl_mapping={},
+        webhook=webhook,
+        firestore_client=firestore,
+        buildium_api=api,
+    )
+
+    assert len(api.updated_leases) == 1
+    assert api.updated_leases[0]["lease_id"] == "lease-1"
+    assert all(call["lease_id"] != "lease-2" for call in api.updated_leases)
+    assert len(api.uploaded_documents) == 1
+    assert api.uploaded_documents[0]["lease_id"] == "lease-1"
+
+    document = firestore.collection_instance.document("acct-1")
+    n1_block = document.data["n1_increase"]
+    assert n1_block["forms_uploaded"] == 1
+    assert "lease-2" in n1_block["ignored_leases"]
+
+
+def test_handle_n1_completion_uploads_summary_documents() -> None:
+    api = FakeBuildiumAPI()
+    schedule = {
+        "lease_id": "lease-1",
+        "property_id": "prop-1",
+        "unit_id": "unit-1",
+        "property_name": "Property One",
+        "unit_name": "101",
+        "current_rent": "1200.00",
+        "new_rent": "1236.00",
+        "increase_rate": "0.03",
+        "increase_rate_percent": "3.00%",
+        "increase_amount": "36.00",
+        "effective_date": "2024-09-01",
+        "is_extended": False,
+        "extension_end_date": None,
+    }
+
+    firestore = FakeFirestore(
+        initial_docs={
+            "acct-1": {
+                "n1_increase": {
+                    "schedules": [schedule],
+                    "payload_chunks": [],
+                    "summary_files": {
+                        "custom": base64.b64encode(b"binary").decode("ascii"),
+                    },
+                    "property_tasks": {"prop-1": {"task_id": "task-5"}},
+                }
+            }
+        }
+    )
+
+    webhook = {"eventType": "TaskStatusChanged", "task": {"status": "Completed"}}
+
+    n1_increase.handle_n1_increase_automation(
+        account_id="acct-1",
+        api_headers={"Authorization": "Bearer token"},
+        gl_mapping={},
+        webhook=webhook,
+        firestore_client=firestore,
+        buildium_api=api,
+    )
+
+    assert api.presign_requests[0]["filename"] == "N1 Summary - custom.bin"
+    assert api.presign_requests[0]["metadata"]["label"] == "custom"
+    assert api.presigned_uploads[0]["content"] == b"binary"
+    assert len(api.task_comments) == 1
+    assert api.task_comments[0]["task_id"] == "task-5"
