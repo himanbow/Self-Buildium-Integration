@@ -268,8 +268,11 @@ async def handle_buildium_webhook(request: Request) -> Response:
 @app.post("/tasks/buildium-webhook", status_code=status.HTTP_204_NO_CONTENT)
 async def handle_buildium_webhook_task(request: Request) -> Response:
     """Execute queued Buildium webhook work from Cloud Tasks."""
+    logger.info("Entering tasks.")
+
 
     try:
+        logger.info("Entering payload.")
         payload = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(
@@ -292,6 +295,7 @@ async def handle_buildium_webhook_task(request: Request) -> Response:
             detail="Task payload could not be parsed.",
         ) from exc
 
+    logger.info("Entering processor.")
     processor = BuildiumWebhookProcessor(verified_webhook)
 
     logger.info(
