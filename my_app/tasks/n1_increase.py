@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from collections import defaultdict
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -15,6 +15,7 @@ from urllib import request as urllib_request
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
+from . import n1_completion
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +75,47 @@ class BuildiumN1API(Protocol):
     ) -> Mapping[str, Any]:
         ...
 
+    def create_lease_renewal(
+        self, *, lease_id: str, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        ...
+
     def create_task(
         self,
         *,
         category_id: Optional[str],
         name: str,
         description: str,
+    ) -> Mapping[str, Any]:
+        ...
+
+    def create_task_history_comment(
+        self, *, task_id: str, body: str
+    ) -> Mapping[str, Any]:
+        ...
+
+    def list_task_categories(self) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def create_task_category(self, *, name: str) -> Mapping[str, Any]:
+        ...
+
+    def request_presigned_upload(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
+
+    def upload_to_presigned_url(
+        self,
+        *,
+        url: str,
+        fields: Mapping[str, Any],
+        content: bytes,
+        content_type: str,
     ) -> Mapping[str, Any]:
         ...
 
@@ -243,6 +279,86 @@ class RequestsBuildiumAPI:
         if category_id:
             payload["taskCategoryId"] = category_id
         return self._post("tasks", payload)
+
+    def create_task_history_comment(
+        self, *, task_id: str, body: str
+    ) -> Mapping[str, Any]:
+        payload = {"body": body}
+        return self._post(f"tasks/{task_id}/history", payload)
+
+    def list_task_categories(self) -> Sequence[Mapping[str, Any]]:
+        response = self._get("tasks/categories")
+        if isinstance(response, Sequence) and not isinstance(response, (str, bytes)):
+            return [dict(item) for item in response if isinstance(item, Mapping)]
+        if isinstance(response, Mapping):
+            items = response.get("items")
+            if isinstance(items, Iterable):
+                return [dict(item) for item in items if isinstance(item, Mapping)]
+            return [dict(response)]
+        return []
+
+    def create_task_category(self, *, name: str) -> Mapping[str, Any]:
+        return self._post("tasks/categories", {"name": name})
+
+    def create_lease_renewal(
+        self, *, lease_id: str, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        return self._post(f"leases/{lease_id}/renewals", payload)
+
+    def request_presigned_upload(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        payload: Dict[str, Any] = {
+            "fileName": filename,
+            "contentType": content_type,
+        }
+        if metadata:
+            payload["metadata"] = dict(metadata)
+        return self._post("documents/uploadurl", payload)
+
+    def upload_to_presigned_url(
+        self,
+        *,
+        url: str,
+        fields: Mapping[str, Any],
+        content: bytes,
+        content_type: str,
+    ) -> Mapping[str, Any]:
+        boundary = f"----BuildiumBoundary{uuid.uuid4().hex}"
+        buffer = BytesIO()
+        for name, value in fields.items():
+            text_value = value if isinstance(value, str) else str(value)
+            buffer.write(
+                (
+                    f"--{boundary}\r\n"
+                    f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                    f"{text_value}\r\n"
+                ).encode("utf-8")
+            )
+        buffer.write(
+            (
+                f"--{boundary}\r\n"
+                "Content-Disposition: form-data; name=\"file\"; filename=\"upload\"\r\n"
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        buffer.write(content)
+        buffer.write(b"\r\n")
+        buffer.write(f"--{boundary}--\r\n".encode("utf-8"))
+
+        request = urllib_request.Request(
+            url,
+            data=buffer.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib_request.urlopen(request) as response:  # pragma: no cover - network
+            response.read()
+        return {"status": "uploaded"}
 
 
 def _timestamp() -> str:
@@ -577,84 +693,6 @@ def _render_pdf_summary(schedules: Sequence[Mapping[str, Any]]) -> bytes:
     return output.getvalue()
 
 
-def _render_notice(
-    schedule: Mapping[str, Any], payload_entry: Optional[Mapping[str, Any]] = None
-) -> bytes:
-    from . import n1_notice_pdf
-
-    lease_info: Optional[Mapping[str, Any]] = None
-    if isinstance(payload_entry, Mapping):
-        lease_candidate = payload_entry.get("lease")
-        if isinstance(lease_candidate, Mapping):
-            lease_info = lease_candidate
-    return n1_notice_pdf.create_n1_notice_pdf(schedule=schedule, lease=lease_info)
-
-
-def _decode_payload_entries(
-    chunks: Sequence[Mapping[str, Any]]
-) -> List[Mapping[str, Any]]:
-    from . import n1_data
-
-    entries: List[Mapping[str, Any]] = []
-    for chunk in chunks:
-        for entry in n1_data.decode_payload_chunk(chunk):
-            if isinstance(entry, Mapping):
-                entries.append(entry)
-    return entries
-
-
-def _combine_payload_chunks(chunks: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
-    combined: List[Mapping[str, Any]] = []
-    for entry in _decode_payload_entries(chunks):
-        schedule = entry.get("schedule") if isinstance(entry, Mapping) else None
-        if isinstance(schedule, Mapping):
-            combined.append(schedule)
-    return combined
-
-
-def _map_entries_by_lease(
-    entries: Sequence[Mapping[str, Any]]
-) -> Dict[str, Mapping[str, Any]]:
-    mapping: Dict[str, Mapping[str, Any]] = {}
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            continue
-        lease_id: Optional[str] = None
-        schedule = entry.get("schedule")
-        if isinstance(schedule, Mapping):
-            lease_identifier = schedule.get("lease_id") or schedule.get("leaseId")
-            if lease_identifier is not None:
-                lease_id = str(lease_identifier)
-        if lease_id is None:
-            lease_block = entry.get("lease")
-            if isinstance(lease_block, Mapping):
-                lease_identifier = (
-                    lease_block.get("id")
-                    or lease_block.get("lease_id")
-                    or lease_block.get("leaseId")
-                )
-                if lease_identifier is not None:
-                    lease_id = str(lease_identifier)
-        if lease_id:
-            mapping[lease_id] = entry
-    return mapping
-
-
-def _build_serving_description(property_name: str, schedules: Sequence[Mapping[str, Any]]) -> str:
-    lines = [
-        f"Serve N1 notices for {property_name}.",
-        "",
-        "Notices to deliver:",
-    ]
-    for schedule in schedules:
-        lines.append(
-            f"- Unit {schedule.get('unit_name', '')}: increase to ${schedule.get('new_rent')} effective {schedule.get('effective_date', '')}"
-        )
-    lines.append("")
-    lines.append("Update this task once all residents have been served.")
-    return "\n".join(lines)
-
-
 def _persist_schedules(
     *,
     document: Any,
@@ -680,28 +718,6 @@ def _persist_schedules(
     )
     merged["n1_increase"] = n1_block
     document.set(dict(merged), merge=True)
-
-
-def _load_document(document: Any) -> Mapping[str, Any]:
-    try:
-        snapshot = document.get()
-    except Exception:
-        logger.exception("Failed to load N1 Firestore document snapshot.")
-        return {}
-    if not getattr(snapshot, "exists", False):
-        return {}
-    try:
-        return snapshot.to_dict() or {}
-    except Exception:
-        logger.exception("Unable to deserialize N1 Firestore document snapshot.")
-        return {}
-
-
-def _ensure_firestore_document(firestore_client: Any, account_id: str) -> Any:
-    collection = firestore_client.collection(FIRESTORE_COLLECTION_PATH)
-    return collection.document(account_id)
-
-
 def _handle_task_created(
     *,
     account_id: str,
@@ -727,8 +743,8 @@ def _handle_task_created(
     excel_bytes = _render_excel_summary(schedules)
     pdf_bytes = _render_pdf_summary(schedules)
 
-    document = _ensure_firestore_document(firestore_client, account_id)
-    existing = _load_document(document)
+    document = n1_completion.ensure_firestore_document(firestore_client, account_id)
+    existing = n1_completion.load_document(document)
     merged_existing = dict(existing)
     merged_existing.setdefault("gl_mapping", dict(gl_mapping))
     existing_n1_block = dict(merged_existing.get("n1_increase") or {})
@@ -767,92 +783,11 @@ def _handle_task_completed(
     buildium_api: Optional[BuildiumN1API],
     api_headers: Mapping[str, str],
 ) -> None:
-    document = _ensure_firestore_document(firestore_client, account_id)
-    data = _load_document(document)
-    if not data:
-        logger.warning(
-            "No Firestore data found for completed N1 automation.",
-            extra={"account_id": account_id},
-        )
-        return
-
-    n1_block = data.get("n1_increase") or {}
-    schedules: List[Mapping[str, Any]] = list(n1_block.get("schedules") or [])
-    payload_chunks = list(n1_block.get("payload_chunks") or [])
-    payload_entries = _decode_payload_entries(payload_chunks)
-    if not schedules and payload_entries:
-        schedules = [
-            entry_schedule
-            for entry_schedule in (
-                entry.get("schedule") if isinstance(entry, Mapping) else None
-                for entry in payload_entries
-            )
-            if isinstance(entry_schedule, Mapping)
-        ]
-    if not schedules:
-        logger.warning(
-            "No prepared schedules available for N1 completion.",
-            extra={"account_id": account_id},
-        )
-        return
-
-    api = buildium_api or RequestsBuildiumAPI(api_headers=api_headers)
-
-    property_groups: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
-    entry_map = _map_entries_by_lease(payload_entries)
-    for schedule in schedules:
-        lease_id = str(schedule.get("lease_id"))
-        property_id = str(schedule.get("property_id"))
-        new_rent = _decimal(schedule.get("new_rent"))
-        payload = {
-            "leaseId": lease_id,
-            "newRent": float(new_rent),
-        }
-        api.update_lease(lease_id=lease_id, payload=payload)
-        if schedule.get("is_extended"):
-            api.extend_lease(
-                lease_id=lease_id,
-                end_date=schedule.get("extension_end_date"),
-            )
-
-        notice_bytes = _render_notice(schedule, entry_map.get(lease_id))
-        api.upload_document(
-            lease_id=lease_id,
-            property_id=property_id,
-            filename=f"N1-{lease_id}.pdf",
-            content=notice_bytes,
-            content_type="application/pdf",
-        )
-        property_groups[property_id].append(schedule)
-
-    category_id = data.get("automated_tasks_category_id") or n1_block.get(
-        "automated_tasks_category_id"
-    )
-    for property_id, schedules_for_property in property_groups.items():
-        property_name = schedules_for_property[0].get("property_name", "Property")
-        description = _build_serving_description(property_name, schedules_for_property)
-        api.create_task(
-            category_id=category_id,
-            name=f"Serve N1 Notices - {property_name}",
-            description=description,
-        )
-
-    n1_updates = {
-        "n1_increase": {
-            **n1_block,
-            "completed_at": _timestamp(),
-            "forms_uploaded": sum(len(v) for v in property_groups.values()),
-        }
-    }
-    document.set(n1_updates, merge=True)
-
-    logger.info(
-        "Completed N1 rent increase fulfillment.",
-        extra={
-            "account_id": account_id,
-            "leases_processed": sum(len(v) for v in property_groups.values()),
-            "properties": len(property_groups),
-        },
+    n1_completion.fulfill_n1_completion(
+        account_id=account_id,
+        firestore_client=firestore_client,
+        api_headers=api_headers,
+        buildium_api=buildium_api,
     )
 
 
