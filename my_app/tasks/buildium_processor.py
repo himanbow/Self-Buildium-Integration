@@ -16,6 +16,12 @@ from typing import Protocol
 from google.api_core import exceptions as google_exceptions
 from google.cloud import tasks_v2
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+
 from ..config import DEFAULT_GCP_PROJECT_ID
 from ..services.account_context import BUILDUM_FIRESTORE_DATABASE
 
