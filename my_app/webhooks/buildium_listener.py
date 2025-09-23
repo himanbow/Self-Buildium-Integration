@@ -5,12 +5,19 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import multiprocessing
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 import uvicorn
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 
 from ..tasks.buildium_processor import (
     BuildiumProcessorError,
