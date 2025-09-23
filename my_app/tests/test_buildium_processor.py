@@ -4,7 +4,7 @@ import base64
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 from unittest.mock import Mock
 
 import importlib
@@ -28,6 +28,50 @@ class _StubAccountContext:
     metadata: Mapping[str, Any]
     api_secret: str
     webhook_secret: str
+
+
+@dataclass
+class _StubTasksApi:
+    response: Mapping[str, Any]
+    side_effect: Optional[Exception] = None
+    calls: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        self.calls = []
+
+    def get_task_by_id(self, task_id: int) -> Mapping[str, Any]:
+        self.calls.append(task_id)
+        if self.side_effect is not None:
+            raise self.side_effect
+        return self.response
+
+
+def _patch_tasks_api(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Optional[Mapping[str, Any]],
+    *,
+    side_effect: Optional[Exception] = None,
+):
+    captured_headers: Dict[str, Any] = {}
+
+    if response is None:
+        def _factory(api_headers: Mapping[str, Any]) -> None:
+            captured_headers.clear()
+            captured_headers.update(dict(api_headers))
+            return None
+
+        monkeypatch.setattr(buildium_processor, "_build_tasks_api", _factory)
+        return None, captured_headers
+
+    stub = _StubTasksApi(response=response, side_effect=side_effect)
+
+    def _factory(api_headers: Mapping[str, Any]) -> _StubTasksApi:
+        captured_headers.clear()
+        captured_headers.update(dict(api_headers))
+        return stub
+
+    monkeypatch.setattr(buildium_processor, "_build_tasks_api", _factory)
+    return stub, captured_headers
 
 
 def _make_processor(parsed_body: Mapping[str, Any]) -> Any:
@@ -85,6 +129,7 @@ def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
         "task": {
             "taskName": "Initiation",
             "taskCategoryName": "General",
+            "taskId": 101,
         },
     }
     payload = _base_payload(webhook_payload)
@@ -96,9 +141,16 @@ def test_perform_work_ignores_non_automated_tasks(monkeypatch) -> None:
         {("taskcreated", "initiation"): mock_handler},
     )
 
+    stub, headers = _patch_tasks_api(
+        monkeypatch,
+        {"Title": "Initiation", "Category": {"taskCategoryName": "General"}},
+    )
+
     processor._perform_work(payload)
 
     mock_handler.assert_not_called()
+    assert stub.calls == [101]
+    assert headers == {"Authorization": "Bearer token"}
 
 
 def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
@@ -109,13 +161,15 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
         "task": {
             "taskName": "Initiation",
             "taskCategoryName": "Automated Tasks",
+            "taskId": 202,
         },
     }
     n1_webhook = {
         "eventType": "TaskStatusChanged",
         "task": {
             "taskName": "N1 Increase",
-            "taskCategoryName": "Automated Tasks",
+            "taskCategoryName": "General",
+            "taskId": 303,
         },
     }
 
@@ -130,6 +184,15 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
         },
     )
 
+    init_stub, init_headers = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 202,
+            "Title": "Initiation",
+            "Category": {"taskCategoryName": "Automated Tasks"},
+        },
+    )
+
     processor._perform_work(_base_payload(initiation_webhook))
 
     init_handler.assert_called_once()
@@ -137,7 +200,22 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
     assert init_call.kwargs["account_id"] == "acct-123"
     assert init_call.kwargs["api_headers"] == {"Authorization": "Bearer token"}
     assert init_call.kwargs["gl_mapping"] == {"code": "value"}
-    assert init_call.kwargs["webhook"] == initiation_webhook
+    assert init_stub.calls == [202]
+    assert init_headers == {"Authorization": "Bearer token"}
+    assert init_call.kwargs["webhook"]["task"] == {
+        "Id": 202,
+        "Title": "Initiation",
+        "Category": {"taskCategoryName": "Automated Tasks"},
+    }
+
+    n1_stub, n1_headers = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 303,
+            "Title": "N1 Increase",
+            "Category": {"taskCategoryName": "Automated Tasks"},
+        },
+    )
 
     processor._perform_work(_base_payload(n1_webhook))
 
@@ -146,7 +224,13 @@ def test_perform_work_routes_automated_tasks(monkeypatch) -> None:
     assert n1_call.kwargs["account_id"] == "acct-123"
     assert n1_call.kwargs["api_headers"] == {"Authorization": "Bearer token"}
     assert n1_call.kwargs["gl_mapping"] == {"code": "value"}
-    assert n1_call.kwargs["webhook"] == n1_webhook
+    assert n1_stub.calls == [303]
+    assert n1_headers == {"Authorization": "Bearer token"}
+    assert n1_call.kwargs["webhook"]["task"] == {
+        "Id": 303,
+        "Title": "N1 Increase",
+        "Category": {"taskCategoryName": "Automated Tasks"},
+    }
 
 
 def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
@@ -157,6 +241,7 @@ def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
         "task": {
             "taskName": "Ontario Automations Initiation",
             "taskCategoryName": "General",
+            "taskId": 401,
         },
     }
 
@@ -172,9 +257,19 @@ def test_perform_work_routes_initiation_without_category(monkeypatch) -> None:
         lambda account_id: False,
     )
 
+    stub, _ = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 401,
+            "Title": "Ontario Automations Initiation",
+            "Category": {"taskCategoryName": "General"},
+        },
+    )
+
     processor._perform_work(_base_payload(initiation_webhook))
 
     mock_handler.assert_called_once()
+    assert stub.calls == [401]
 
 
 def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
@@ -185,6 +280,7 @@ def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
         "task": {
             "taskName": "Ontario Automations Initiation",
             "taskCategoryName": "General",
+            "taskId": 402,
         },
     }
 
@@ -202,9 +298,58 @@ def test_perform_work_skips_completed_initiation(monkeypatch) -> None:
 
     monkeypatch.setattr(buildium_processor, "_has_completed_initiation", _completed)
 
+    stub, _ = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 402,
+            "Title": "Ontario Automations Initiation",
+            "Category": {"taskCategoryName": "General"},
+        },
+    )
+
     processor._perform_work(_base_payload(initiation_webhook))
 
     mock_handler.assert_not_called()
+    assert stub.calls == [402]
+
+
+def test_perform_work_uses_webhook_when_task_fetch_fails(monkeypatch) -> None:
+    processor = _make_processor({})
+
+    webhook_payload = {
+        "eventType": "TaskStatusChanged",
+        "task": {
+            "taskName": "N1 Increase",
+            "taskCategoryName": "Automated Tasks",
+            "taskId": 909,
+        },
+    }
+    payload = _base_payload(webhook_payload)
+
+    mock_handler = Mock()
+    monkeypatch.setattr(
+        buildium_processor,
+        "_AUTOMATION_ROUTING_TABLE",
+        {("taskstatuschanged", "n1increase"): mock_handler},
+    )
+
+    stub, headers = _patch_tasks_api(
+        monkeypatch,
+        {
+            "Id": 909,
+            "Title": "N1 Increase",
+            "Category": {"taskCategoryName": "Automated Tasks"},
+        },
+        side_effect=RuntimeError("boom"),
+    )
+
+    processor._perform_work(payload)
+
+    mock_handler.assert_called_once()
+    call = mock_handler.call_args
+    assert call.kwargs["webhook"]["task"] == webhook_payload["task"]
+    assert stub.calls == [909]
+    assert headers == {"Authorization": "Bearer token"}
 
 
 def test_enqueue_buildium_webhook_creates_cloud_task(monkeypatch) -> None:
